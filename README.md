@@ -15,7 +15,7 @@ RAG-система для работы с документами, использ
 
 1. Клонируйте репозиторий:
 ```bash
-git clone <repository-url>
+git clone https://github.com/igorvolk1961/smart_rag.git
 cd smart_rag
 ```
 

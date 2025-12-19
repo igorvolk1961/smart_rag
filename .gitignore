@@ -147,5 +147,9 @@ Thumbs.db
 # Project specific
 data/input/
 data/output/
+data/chunks/  # Результаты обработки документов
 logs/
 *.log
+
+# Test files (опционально, можно оставить)
+# test_indexing.py
