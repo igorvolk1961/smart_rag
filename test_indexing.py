@@ -39,7 +39,8 @@ def main():
         return
     
     # Индексация документа
-    document_path = r"F:\git\irs\smart_chanker\data\План строительства моста через реку Лена.docx"
+#    document_path = r"F:\git\irs\smart_chanker\data\План строительства моста через реку Лена.docx"
+    document_path = r"F:\git\irs\smart_chanker\data\План график.docx"
     
     logger.info(f"Начало индексации документа: {document_path}")
     try:

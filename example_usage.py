@@ -41,16 +41,6 @@ def main():
     except Exception as e:
         logger.warning(f"Не удалось получить информацию о коллекции: {e}")
     
-    # # Пример 1: Индексация документа
-    # # Раскомментируйте и укажите путь к вашему документу
-    # document_path = "F:\git\irs\smart_chanker\data\План строительства моста через реку Лена.docx"
-    # try:
-    #     result = rag.index_document(document_path)
-    #     logger.info(f"Документ проиндексирован: {result}")
-    # except Exception as e:
-    #     logger.error(f"Ошибка при индексации документа: {e}", exc_info=True)
-    
-    # Пример 2: Поиск по запросу
     query = "чем кормят работников"
     try:
         results = rag.search(query, top_k=5)

@@ -2,23 +2,44 @@ qdrant:
   executable_path: "f:/programs/qdrant/qdrant.exe"
   config_path: "f:/programs/qdrant/qdrant_config.yaml"
   collection_name: "smart_rag_documents"
-  vector_size: 1024  # Размер эмбеддинга модели jeffh/intfloat-multilingual-e5-large:q8_0
+  vector_size: 1024  # Размер эмбеддинга (1024 для GigaEmbeddings и e5-large)
   url: "http://localhost:6333"  # Qdrant API URL
   timeout: 30
 
 embeddings:
-  model: "jeffh/intfloat-multilingual-e5-large:q8_0"
-  api_url: "http://localhost:11434/v1"
-  batch_size: 8
-  max_retries: 3
-  timeout: 60
+  # Используется GigaEmbeddings от Сбера
+  giga:
+    # Authorization Key берется ТОЛЬКО из переменной окружения GIGACHAT_AUTH_KEY в файле .env
+    # Не указывайте ключ здесь - используйте только .env файл для безопасности
+    scope: "GIGACHAT_API_PERS"  # Область доступа
+    api_url: "https://gigachat.devices.sberbank.ru/api/v1"
+    model: "Embeddings"  # Название модели для эмбеддингов
+    batch_size: 10
+    max_retries: 3
+    timeout: 60
 
 chunker:
-  config_path: "config.json"  # Конфигурация SmartChanker
+  config_path: "smartchanker_config.json"  # Конфигурация SmartChanker
   output_dir: "data/chunks"
 
 rag:
-  top_k: 5                      # Количество чанков для извлечения
+  top_k: 5                      # Финальное количество чанков для извлечения (после реранкера)
+  
+  # Гибридный поиск (векторный + полнотекстовый)
+  hybrid_search:
+    enabled: true               # Включить гибридный поиск
+    vector_top_k: 20            # Количество документов для векторного поиска
+    text_top_k: 20              # Количество документов для полнотекстового поиска
+  
+  # Реранкинг результатов поиска
+  reranker:
+    enabled: true               # Включить реранкинг
+    model: "dengcao/Qwen3-Reranker-0.6B:F16"  # Модель Ollama для реранкинга
+    api_url: "http://localhost:11434"  # URL Ollama API (использует OpenAI-совместимый /v1/chat/completions)
+    max_retries: 3              # Максимальное количество попыток
+    timeout: 60                 # Таймаут запроса в секундах
+    # Реранкер обрабатывает все документы после объединения результатов
+  
   context_expansion:
     enabled: true
     include_parents: true       # Включать родительские разделы

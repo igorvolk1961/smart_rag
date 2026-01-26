@@ -9,7 +9,7 @@ from pathlib import Path
 from llama_index.core.schema import TextNode
 
 from rag.chunker_integration import ChunkerIntegration
-from rag.embeddings import OllamaEmbedding
+from rag.giga_embeddings import GigaEmbedding
 from rag.vector_store import QdrantVectorStoreManager
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ class DocumentIndexer:
     def __init__(
         self,
         chunker: ChunkerIntegration,
-        embedding: OllamaEmbedding,
+        embedding: GigaEmbedding,
         vector_store_manager: QdrantVectorStoreManager
     ):
         """

@@ -17,10 +17,6 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: Optional[str] = None
     
-    # Ollama
-    ollama_api_url: str = "http://localhost:11434/v1"
-    ollama_model: str = "jeffh/intfloat-multilingual-e5-large:q8_0"
-    
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -29,9 +25,11 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "DEBUG"
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore"  # Игнорировать дополнительные переменные окружения
+    }
 
 
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
@@ -92,12 +90,6 @@ def get_config() -> Dict[str, Any]:
     # Обновляем конфигурацию значениями из окружения
     if settings.qdrant_url != "http://localhost:6333":
         config.setdefault("qdrant", {})["url"] = settings.qdrant_url
-    
-    if settings.ollama_api_url != "http://localhost:11434/v1":
-        config.setdefault("embeddings", {})["api_url"] = settings.ollama_api_url
-    
-    if settings.ollama_model != "jeffh/intfloat-multilingual-e5-large:q8_0":
-        config.setdefault("embeddings", {})["model"] = settings.ollama_model
     
     if settings.api_host != "0.0.0.0":
         config.setdefault("api", {})["host"] = settings.api_host

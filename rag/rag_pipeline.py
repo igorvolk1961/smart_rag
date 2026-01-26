@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 
 from utils.config import get_config
 from rag.chunker_integration import ChunkerIntegration
-from rag.embeddings import OllamaEmbedding
+from rag.giga_embeddings import GigaEmbedding
 from rag.vector_store import QdrantVectorStoreManager
 from rag.indexer import DocumentIndexer
 from rag.retriever import DocumentRetriever
@@ -21,7 +21,7 @@ class RAGPipeline:
     
     Объединяет все компоненты системы:
     - Обработку документов через SmartChanker
-    - Генерацию эмбеддингов через Ollama
+    - Генерацию эмбеддингов через GigaChat (GigaEmbeddings)
     - Индексацию в Qdrant
     - Поиск и извлечение контекста
     """
@@ -52,14 +52,27 @@ class RAGPipeline:
             output_dir=chunker_config.get("output_dir", "data/chunks")
         )
         
-        # Конфигурация эмбеддингов
+        # Конфигурация эмбеддингов - используется только GigaEmbeddings
+        import os
         embeddings_config = self.config.get("embeddings", {})
-        self.embedding = OllamaEmbedding(
-            model=embeddings_config.get("model", "jeffh/intfloat-multilingual-e5-large:q8_0"),
-            api_url=embeddings_config.get("api_url", "http://localhost:11434/v1"),
-            batch_size=embeddings_config.get("batch_size", 8),
-            max_retries=embeddings_config.get("max_retries", 3),
-            timeout=embeddings_config.get("timeout", 60)
+        giga_config = embeddings_config.get("giga", {})
+        
+        # Ключ берется ТОЛЬКО из переменной окружения .env
+        credentials = os.getenv("GIGACHAT_AUTH_KEY")
+        if not credentials:
+            logger.warning(
+                "GIGACHAT_AUTH_KEY не найден в переменных окружения. "
+                "Убедитесь, что ключ указан в файле .env"
+            )
+        
+        self.embedding = GigaEmbedding(
+            credentials=credentials,
+            scope=giga_config.get("scope", "GIGACHAT_API_PERS"),
+            api_url=giga_config.get("api_url", "https://gigachat.devices.sberbank.ru/api/v1"),
+            model=giga_config.get("model", "Embeddings"),
+            batch_size=giga_config.get("batch_size", 10),
+            max_retries=giga_config.get("max_retries", 3),
+            timeout=giga_config.get("timeout", 60)
         )
         
         # Конфигурация векторного хранилища
@@ -83,10 +96,34 @@ class RAGPipeline:
             vector_store_manager=self.vector_store_manager
         )
         
+        # Конфигурация гибридного поиска
+        hybrid_config = rag_config.get("hybrid_search", {})
+        
+        # Конфигурация реранкера
+        reranker_config = rag_config.get("reranker", {})
+        reranker = None
+        if reranker_config.get("enabled", False):
+            try:
+                from rag.reranker import ChatCompletionsReranker
+                reranker = ChatCompletionsReranker(
+                    model=reranker_config.get("model", "dengcao/Qwen3-Reranker-0.6B:F16"),
+                    api_url=reranker_config.get("api_url", "http://localhost:11434"),
+                    max_retries=reranker_config.get("max_retries", 3),
+                    timeout=reranker_config.get("timeout", 60)
+                )
+                logger.info("Реранкер инициализирован")
+            except Exception as e:
+                logger.warning(f"Не удалось инициализировать реранкер: {e}")
+                reranker = None
+        
         self.retriever = DocumentRetriever(
             embedding=self.embedding,
             vector_store_manager=self.vector_store_manager,
-            top_k=rag_config.get("top_k", 5)
+            top_k=rag_config.get("top_k", 5),
+            hybrid_search_enabled=hybrid_config.get("enabled", True),
+            vector_top_k=hybrid_config.get("vector_top_k", 20),
+            text_top_k=hybrid_config.get("text_top_k", 20),
+            reranker=reranker
         )
     
     def index_document(

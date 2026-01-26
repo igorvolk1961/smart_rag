@@ -4,7 +4,8 @@ RAG модуль для работы с документами и векторн
 
 from rag.rag_pipeline import RAGPipeline
 from rag.chunker_integration import ChunkerIntegration
-from rag.embeddings import OllamaEmbedding
+from rag.giga_embeddings import GigaEmbedding
+from rag.reranker import ChatCompletionsReranker
 from rag.vector_store import QdrantVectorStoreManager
 from rag.indexer import DocumentIndexer
 from rag.retriever import DocumentRetriever
@@ -12,7 +13,8 @@ from rag.retriever import DocumentRetriever
 __all__ = [
     "RAGPipeline",
     "ChunkerIntegration",
-    "OllamaEmbedding",
+    "GigaEmbedding",
+    "ChatCompletionsReranker",
     "QdrantVectorStoreManager",
     "DocumentIndexer",
     "DocumentRetriever",
