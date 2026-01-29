@@ -2,64 +2,104 @@
 Роуты для работы с LLM API.
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+import json
+import re
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from loguru import logger
 
-from api.models.llm_models import LLMRequest, LLMResponse, ErrorResponse
+from api.models.llm_models import AssistantRequest, error_response_body
 from api.services.llm_service import get_llm_service, LLMService
+from api.exceptions import ServiceError
 
 
 router = APIRouter(prefix="/api/v1/llm", tags=["LLM"])
 
 
+def _normalize_content_to_response(content: str):
+    """
+    Возвращает тело ответа: только content.
+    Если content — текст json-объекта в обёртке ```json ... ``` или после strip
+    начинается с '{', возвращается распарсенный JSON-объект; иначе — строка content.
+    """
+    if not content or not content.strip():
+        return content
+    text = content.strip()
+    # Удалить префикс ```json (без учёта регистра) и финальные ```
+    json_block = re.match(r"^```json\s*\n?(.*)\n?```\s*$", text, re.DOTALL | re.IGNORECASE)
+    if json_block:
+        inner = json_block.group(1).strip()
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            pass
+    # Текст, начинающийся с {, тоже пробуем распарсить как JSON
+    if text.startswith("{"):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    return content
+
+
 @router.post(
     "/generate",
-    response_model=LLMResponse,
-    responses={
-        400: {"model": ErrorResponse},
-        500: {"model": ErrorResponse}
-    },
     summary="Генерация ответа от LLM",
-    description="Отправка запроса к LLM через OpenAI API с кэшированием конфигурации"
+    description=(
+        "При успехе возвращает 200 и только поле content ответа. "
+        "Если content — JSON в обёртке ```json ... ```, возвращается распарсенный объект. "
+        "При internet=false и knowledge_base=false вызывается простой LLM; иначе — agent_call. "
+        "При ошибке — 200 и объект с полем error (и detail, code, errors при валидации)."
+    ),
 )
 async def generate_response(
-    request: LLMRequest,
+    request: AssistantRequest,
     llm_service: LLMService = Depends(get_llm_service)
-) -> LLMResponse:
+):
     """
-    Генерация ответа от LLM.
-    
-    Args:
-        request: Запрос к LLM с конфигурацией OpenAI API
-        llm_service: Сервис для работы с LLM
-        
-    Returns:
-        Ответ от LLM
-        
-    Raises:
-        HTTPException: При ошибке обработки запроса
+    Генерация ответа ассистента. Всегда HTTP 200: проверяйте наличие поля error в теле.
+    Возвращает только content; при JSON-обёртке — распарсенный объект.
     """
     try:
         logger.info("Получен запрос на генерацию ответа от LLM")
-        
-        if not request.message:
-            raise HTTPException(
-                status_code=400,
-                detail="Поле 'message' обязательно для заполнения"
+
+        if not request.current_message or not request.current_message.strip():
+            return JSONResponse(
+                status_code=200,
+                content=error_response_body(
+                    error="Ошибка валидации запроса",
+                    detail="Поле 'current_message' обязательно для заполнения и не может быть пустым.",
+                    code="missing_current_message",
+                ),
             )
-        
-        response = await llm_service.generate_response(request)
-        
+
+        if not request.internet and not request.knowledge_base:
+            response = await llm_service.simple_llm_call(request)
+        else:
+            response = await llm_service.agent_call(request)
+
         logger.info("Ответ успешно сгенерирован")
-        return response
-        
-    except HTTPException:
-        raise
+        body = _normalize_content_to_response(response.content)
+        return JSONResponse(status_code=200, content=body)
+
+    except ServiceError as e:
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error=e.error,
+                detail=e.detail,
+                code=e.code,
+            ),
+        )
     except Exception as e:
-        logger.error(f"Ошибка при генерации ответа: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Внутренняя ошибка сервера: {str(e)}"
+        logger.exception("Неожиданная ошибка при генерации ответа")
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error="Внутренняя ошибка сервера",
+                detail=str(e),
+                code="internal_error",
+            ),
         )
 
 

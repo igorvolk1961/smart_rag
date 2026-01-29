@@ -8,7 +8,13 @@ from loguru import logger
 import openai
 from openai import OpenAI
 
-from api.models.llm_models import OpenAIConfig, LLMRequest, LLMResponse
+from api.models.llm_models import (
+    OpenAIConfig,
+    LLMRequest,
+    AssistantRequest,
+    AssistantResponse,
+)
+from api.exceptions import ServiceError
 
 
 class ConfigCache:
@@ -86,11 +92,51 @@ class LLMService:
     
     def __init__(self):
         self.cache = _config_cache
-    
+
+    async def simple_llm_call(self, request: AssistantRequest) -> AssistantResponse:
+        """
+        Простой вызов LLM без агента (без интернета и базы знаний).
+        Строит LLMRequest из AssistantRequest и вызывает generate_response.
+        """
+        openai_config = OpenAIConfig(
+            api_key=request.llm_api_key,
+            base_url=request.llm_url,
+        )
+        has_history = request.chat_history and len(request.chat_history) > 0
+        if has_history:
+            messages = [{"role": m.role, "content": m.content} for m in request.chat_history]
+            messages.append({"role": "user", "content": request.current_message})
+        elif request.system_prompt:
+            messages = [
+                {"role": "system", "content": request.system_prompt},
+                {"role": "user", "content": request.current_message},
+            ]
+        else:
+            messages = [{"role": "user", "content": request.current_message}]
+        extra_params = {"n": request.n} if request.n != 1 else None
+        llm_request = LLMRequest(
+            openai_config=openai_config,
+            messages=messages,
+            model=request.llm_model_name,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            extra_params=extra_params,
+        )
+        return await self.generate_response(llm_request)
+
+    async def agent_call(self, request: AssistantRequest) -> AssistantResponse:
+        """
+        Вызов с агентом (интернет и/или база знаний).
+        Реализация будет добавлена отдельно.
+        """
+        raise NotImplementedError(
+            "agent_call: реализация будет обсуждена отдельно (internet/knowledge_base)"
+        )
+
     async def generate_response(
         self,
         request: LLMRequest
-    ) -> LLMResponse:
+    ) -> AssistantResponse:
         """
         Генерация ответа от LLM.
         
@@ -115,19 +161,16 @@ class LLMService:
             
             if request.max_tokens:
                 completion_params["max_tokens"] = request.max_tokens
-            
-            # Формируем сообщения
-            messages = []
-            if request.message:
-                messages.append({
-                    "role": "user",
-                    "content": request.message
-                })
-            
-            if messages:
-                completion_params["messages"] = messages
-            
-            # Добавляем дополнительные параметры если есть
+
+            if not request.messages:
+                raise ServiceError(
+                    error="Ошибка валидации запроса",
+                    detail="Поле messages обязательно для вызова LLM.",
+                    status_code=400,
+                    code="missing_messages",
+                )
+            completion_params["messages"] = request.messages
+
             if request.extra_params:
                 completion_params.update(request.extra_params)
             
@@ -152,21 +195,81 @@ class LLMService:
                 
                 logger.info(f"Получен ответ от модели {request.model}")
                 
-                return LLMResponse(
+                return AssistantResponse(
                     content=content,
                     model=response.model,
                     usage=usage,
                     finish_reason=choice.finish_reason
                 )
             else:
-                raise ValueError("Пустой ответ от API")
-                
+                raise ServiceError(
+                    error="Пустой ответ от провайдера LLM",
+                    detail="API вернул ответ без choices.",
+                    status_code=502,
+                    code="empty_response",
+                )
+
+        except openai.AuthenticationError as e:
+            logger.error(f"Ошибка аутентификации LLM API: {e}")
+            raise ServiceError(
+                error="Ошибка аутентификации",
+                detail="Неверный или недействительный API-ключ LLM. Проверьте llm_api_key.",
+                status_code=401,
+                code="llm_auth_error",
+            ) from e
+        except openai.RateLimitError as e:
+            logger.error(f"Превышен лимит запросов LLM: {e}")
+            raise ServiceError(
+                error="Превышен лимит запросов",
+                detail="Провайдер LLM ограничил частоту запросов. Повторите попытку позже.",
+                status_code=429,
+                code="rate_limit",
+            ) from e
+        except openai.APIConnectionError as e:
+            logger.error(f"Ошибка соединения с LLM API: {e}")
+            raise ServiceError(
+                error="Ошибка соединения с провайдером",
+                detail=f"Не удалось подключиться к LLM API: {e!s}. Проверьте llm_url и доступность сервиса.",
+                status_code=503,
+                code="connection_error",
+            ) from e
+        except openai.APITimeoutError as e:
+            logger.error(f"Таймаут запроса к LLM: {e}")
+            raise ServiceError(
+                error="Таймаут запроса",
+                detail="Провайдер LLM не ответил вовремя. Повторите запрос.",
+                status_code=504,
+                code="timeout",
+            ) from e
+        except openai.BadRequestError as e:
+            logger.error(f"Неверный запрос к LLM API: {e}")
+            raise ServiceError(
+                error="Неверный запрос к LLM",
+                detail=f"Провайдер отклонил запрос: {e!s}. Проверьте модель и параметры.",
+                status_code=400,
+                code="bad_request",
+            ) from e
         except openai.OpenAIError as e:
-            logger.error(f"Ошибка OpenAI API: {e}")
-            raise Exception(f"Ошибка при обращении к OpenAI API: {str(e)}")
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
+            logger.error(f"Ошибка OpenAI/LLM API: {e}")
+            status_code = 502
+            if hasattr(e, "response") and e.response is not None:
+                status_code = getattr(e.response, "status_code", 502)
+            raise ServiceError(
+                error="Ошибка провайдера LLM",
+                detail=str(e),
+                status_code=status_code,
+                code="llm_api_error",
+            ) from e
+        except ServiceError:
             raise
+        except Exception as e:
+            logger.exception("Неожиданная ошибка при обращении к LLM")
+            raise ServiceError(
+                error="Внутренняя ошибка сервера",
+                detail=str(e),
+                status_code=500,
+                code="internal_error",
+            ) from e
 
 
 def get_llm_service() -> LLMService:

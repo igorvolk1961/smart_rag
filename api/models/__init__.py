@@ -5,14 +5,18 @@ API models модуль.
 from api.models.llm_models import (
     OpenAIConfig,
     LLMRequest,
-    LLMResponse,
+    ChatMessage,
+    AssistantRequest,
+    AssistantResponse,
     ErrorResponse
 )
 
 __all__ = [
     "OpenAIConfig",
     "LLMRequest",
-    "LLMResponse",
+    "ChatMessage",
+    "AssistantRequest",
+    "AssistantResponse",
     "ErrorResponse"
 ]
 
