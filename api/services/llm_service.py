@@ -93,11 +93,15 @@ class LLMService:
     def __init__(self):
         self.cache = _config_cache
 
-    async def simple_llm_call(self, request: AssistantRequest) -> AssistantResponse:
+    async def simple_llm_call(
+        self, request: AssistantRequest, context: Optional[Dict[str, Any]] = None
+    ) -> AssistantResponse:
         """
         Простой вызов LLM без агента (без интернета и базы знаний).
         Строит LLMRequest из AssistantRequest и вызывает generate_response.
+        context передаётся из роута (userPost и др.).
         """
+        context = context or {}
         openai_config = OpenAIConfig(
             api_key=request.llm_api_key,
             base_url=request.llm_url,
@@ -107,8 +111,15 @@ class LLMService:
             messages = [{"role": m.role, "content": m.content} for m in request.chat_history]
             messages.append({"role": "user", "content": request.current_message})
         elif request.system_prompt:
+            system_prompt = request.system_prompt
+            user_post = ""
+            user_info = context.get("userInfo")
+            if user_info and isinstance(user_info, dict):
+                user_post = user_info.get("userPost") or ""
+            # Замена только {userPost}, без .format(), чтобы не трогать фигурные скобки в JSON
+            system_prompt = system_prompt.replace("{userPost}", user_post)
             messages = [
-                {"role": "system", "content": request.system_prompt},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": request.current_message},
             ]
         else:
@@ -124,11 +135,14 @@ class LLMService:
         )
         return await self.generate_response(llm_request)
 
-    async def agent_call(self, request: AssistantRequest) -> AssistantResponse:
+    async def agent_call(
+        self, request: AssistantRequest, context: Optional[Dict[str, Any]] = None
+    ) -> AssistantResponse:
         """
         Вызов с агентом (интернет и/или база знаний).
-        Реализация будет добавлена отдельно.
+        Реализация будет добавлена отдельно. context передаётся из роута (userPost и др.).
         """
+        context = context or {}
         raise NotImplementedError(
             "agent_call: реализация будет обсуждена отдельно (internet/knowledge_base)"
         )

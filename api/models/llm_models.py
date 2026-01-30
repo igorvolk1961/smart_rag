@@ -71,6 +71,9 @@ class AssistantRequest(BaseModel):
     internet: bool = Field(False, description="Использовать интернет")
     knowledge_base: bool = Field(False, description="Использовать базу знаний")
 
+    # Контекст
+    irv_id: Optional[str] = Field(None, description="UUID версии текущего информационного объекта")
+
 
 class AssistantResponse(BaseModel):
     """Ответ от LLM."""

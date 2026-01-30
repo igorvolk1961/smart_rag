@@ -4,16 +4,43 @@
 
 import json
 import re
-from fastapi import APIRouter, Depends
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 
 from api.models.llm_models import AssistantRequest, error_response_body
 from api.services.llm_service import get_llm_service, LLMService
+from api.siu_client import SiuClient
 from api.exceptions import ServiceError
 
 
 router = APIRouter(prefix="/api/v1/llm", tags=["LLM"])
+
+
+def extract_callback_info(http_request: Request) -> dict[str, Any]:
+    """
+    Извлекает из заголовков referer и cookie base_referer_url и JSESSIONID.
+    Возвращает объект context с полями base_referer_url и jsessionid.
+    """
+    referer = http_request.headers.get("referer") or ""
+    cookie = http_request.headers.get("cookie") or ""
+
+    base_referer_url = ""
+    if referer:
+        parsed = urlparse(referer)
+        base_referer_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else referer
+
+    jsessionid = None
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.upper().startswith("JSESSIONID="):
+            jsessionid = part.split("=", 1)[1].strip()
+            break
+
+    return {"base_referer_url": base_referer_url, "jsessionid": jsessionid}
 
 
 def _normalize_content_to_response(content: str):
@@ -54,6 +81,7 @@ def _normalize_content_to_response(content: str):
 )
 async def generate_response(
     request: AssistantRequest,
+    http_request: Request,
     llm_service: LLMService = Depends(get_llm_service)
 ):
     """
@@ -62,6 +90,12 @@ async def generate_response(
     """
     try:
         logger.info("Получен запрос на генерацию ответа от LLM")
+
+        context = extract_callback_info(http_request)
+        siu_client = SiuClient(context["base_referer_url"], context["jsessionid"])
+        context["userInfo"] = siu_client.get_current_user_info()
+        context["userPost"] = context["userInfo"].get("userPost")
+        context["irvInfo"] = siu_client.get_irv_info(request.irv_id)
 
         if not request.current_message or not request.current_message.strip():
             return JSONResponse(
@@ -74,9 +108,9 @@ async def generate_response(
             )
 
         if not request.internet and not request.knowledge_base:
-            response = await llm_service.simple_llm_call(request)
+            response = await llm_service.simple_llm_call(request, context)
         else:
-            response = await llm_service.agent_call(request)
+            response = await llm_service.agent_call(request, context)
 
         logger.info("Ответ успешно сгенерирован")
         body = _normalize_content_to_response(response.content)
