@@ -40,7 +40,7 @@ def extract_callback_info(http_request: Request) -> dict[str, Any]:
             jsessionid = part.split("=", 1)[1].strip()
             break
 
-    return {"base_referer_url": base_referer_url, "jsessionid": jsessionid}
+    return base_referer_url, jsessionid
 
 
 def _normalize_content_to_response(content: str):
@@ -91,8 +91,9 @@ async def generate_response(
     try:
         logger.info("Получен запрос на генерацию ответа от LLM")
 
-        context = extract_callback_info(http_request)
-        siu_client = SiuClient(context["base_referer_url"], context["jsessionid"])
+        base_referer_url, jsessionid = extract_callback_info(http_request)
+        siu_client = SiuClient(base_referer_url, jsessionid)
+        context = {}
         context["userInfo"] = siu_client.get_current_user_info()
         context["userPost"] = context["userInfo"].get("userPost")
         context["irvInfo"] = siu_client.get_irv_info(request.irv_id)
@@ -114,7 +115,8 @@ async def generate_response(
 
         logger.info("Ответ успешно сгенерирован")
         body = _normalize_content_to_response(response.content)
-        return JSONResponse(status_code=200, content=body)
+        jsonResponse = JSONResponse(status_code=200, content=body)
+        return jsonResponse
 
     except ServiceError as e:
         return JSONResponse(
