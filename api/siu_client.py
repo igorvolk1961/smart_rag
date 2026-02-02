@@ -188,7 +188,7 @@ class SiuClient:
                 meta_ids[data["name"]] = data
         return meta_ids
 
-    def create_folder(self, folder_name: str, parent_folder_id: str) -> Any:
+    def create_folder(self, folder_name: str, parent_folder_id: str, description: Optional[str] = None) -> Any:
         """Поиск или создание папки (reportSiuCreateFolder). Ищет по имени, при отсутствии создаёт."""
         find_body = {"name": folder_name}
         old = self._post(
@@ -200,9 +200,12 @@ class SiuClient:
         old_data = old.get("data", old) if isinstance(old, dict) else old
         if isinstance(old_data, dict) and old_data.get("error", "").find("not found") == -1:
             return old
+        create_body = {"name": folder_name}
+        if description:
+            create_body["description"] = description
         new = self._post(
             f"/folder/{parent_folder_id}/childs",
-            json_body=find_body,
+            json_body=create_body,
             error_label="создание дочерней папки",
             error_code="folder_create_service_error",
         )
@@ -375,8 +378,30 @@ class SiuClient:
         comment: Optional[str] = None,
         metadata: Optional[Any] = None,
         file_name: Optional[Union[str, List[str]]] = None,
+        io_id: Optional[str] = None,
     ) -> Any:
-        """Создание ИР в папке (reportSiuCreateIr). metadata — объект для xml; file_name — строка или список имён."""
+        """Создание ИР в папке (reportSiuCreateIr). metadata — объект для xml; file_name — строка или список имён.
+        Если передан io_id, создаётся новая версия существующего ИО (тело с ioId без поиска по имени)."""
+        if io_id:
+            irv: dict[str, Any] = {
+                "ioId": io_id,
+                "name": irv_name,
+                "description": description or irv_name,
+                "nauId": nau_id,
+            }
+            if comment:
+                irv["comment"] = comment
+            if metadata is not None:
+                irv["xmlMetaDataString"] = metadata
+            if file_name is not None:
+                irv["fileName"] = "&comma;".join(file_name) if isinstance(file_name, list) else file_name
+                irv["fileNameSeparator"] = "&comma;"
+            return self._post(
+                f"/folder/{parent_folder_id}/irvs",
+                json_body=irv,
+                error_label="создание новой версии ИР",
+                error_code="irv_create_service_error",
+            )
         find_body = {"name": irv_name, "withMetaData": False}
         raw_irvs = self._post(
             f"/folder/{parent_folder_id}/irvs/find",
@@ -385,7 +410,7 @@ class SiuClient:
             error_code="irv_find_service_error",
         )
         irvs_list = raw_irvs if isinstance(raw_irvs, list) else (raw_irvs.get("contents", []) if isinstance(raw_irvs, dict) else [])
-        irv: dict[str, Any] = find_body.copy()
+        irv = find_body.copy()
         for the_irv in irvs_list:
             data = the_irv.get("data", the_irv) if isinstance(the_irv, dict) else the_irv
             if isinstance(data, dict) and data.get("name") == irv_name:

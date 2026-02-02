@@ -2,6 +2,8 @@
 Сервис для работы с LLM через OpenAI API.
 """
 
+import json
+import re
 from typing import Dict, Optional, Any
 from functools import lru_cache
 from loguru import logger
@@ -95,20 +97,22 @@ class LLMService:
 
     async def simple_llm_call(
         self, request: AssistantRequest, context: Optional[Dict[str, Any]] = None
-    ) -> AssistantResponse:
+    ) -> dict[str, Any]:
         """
         Простой вызов LLM без агента (без интернета и базы знаний).
         Строит LLMRequest из AssistantRequest и вызывает generate_response.
         context передаётся из роута (userPost и др.).
+        Возвращает словарь с полем content или error.
         """
         context = context or {}
         openai_config = OpenAIConfig(
             api_key=request.llm_api_key,
             base_url=request.llm_url,
         )
-        has_history = request.chat_history and len(request.chat_history) > 0
+        chat_messages = context.get("chat_messages")
+        has_history = chat_messages and len(chat_messages) > 0
         if has_history:
-            messages = [{"role": m.role, "content": m.content} for m in request.chat_history]
+            messages = [{"role": m["role"], "content": m["content"]} for m in chat_messages]
             messages.append({"role": "user", "content": request.current_message})
         elif request.system_prompt:
             system_prompt = request.system_prompt
@@ -117,7 +121,7 @@ class LLMService:
             if user_info and isinstance(user_info, dict):
                 user_post = user_info.get("userPost") or ""
             # Замена только {userPost}, без .format(), чтобы не трогать фигурные скобки в JSON
-            system_prompt = system_prompt.replace("{userPost}", user_post)
+            system_prompt = system_prompt.replace("{userPost}", f"Моя должность - {user_post}.")
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": request.current_message},
@@ -125,6 +129,7 @@ class LLMService:
         else:
             messages = [{"role": "user", "content": request.current_message}]
         extra_params = {"n": request.n} if request.n != 1 else None
+        context["messages_sent"] = messages
         llm_request = LLMRequest(
             openai_config=openai_config,
             messages=messages,
@@ -137,22 +142,25 @@ class LLMService:
 
     async def agent_call(
         self, request: AssistantRequest, context: Optional[Dict[str, Any]] = None
-    ) -> AssistantResponse:
+    ) -> dict[str, Any]:
         """
         Вызов с агентом (интернет и/или база знаний).
         Реализация будет добавлена отдельно. context передаётся из роута (userPost и др.).
+        Возвращает словарь с полем content или error.
         """
         context = context or {}
-        raise NotImplementedError(
-            "agent_call: реализация будет обсуждена отдельно (internet/knowledge_base)"
-        )
+        return {
+            "error": "Метод не реализован",
+            "detail": "agent_call: реализация будет обсуждена отдельно (internet/knowledge_base)",
+            "code": "not_implemented",
+        }
 
     async def generate_response(
         self,
         request: LLMRequest
-    ) -> AssistantResponse:
+    ) -> dict[str, Any]:
         """
-        Генерация ответа от LLM.
+        Генерация ответа от LLM с повторными попытками при отсутствии answer в структурированном ответе.
         
         Args:
             request: Запрос к LLM
@@ -161,129 +169,208 @@ class LLMService:
             Ответ от LLM
             
         Raises:
-            Exception: При ошибке обращения к API
+            Exception: При ошибке обращения к API или если answer не найден после всех попыток
         """
-        try:
-            # Получаем клиент из кэша
-            client = self.cache.get_client(request.openai_config)
-            
-            # Подготавливаем параметры запроса
-            completion_params = {
-                "model": request.model,
-                "temperature": request.temperature,
+        # Получаем клиент из кэша
+        client = self.cache.get_client(request.openai_config)
+        
+        # Подготавливаем параметры запроса
+        completion_params = {
+            "model": request.model,
+            "temperature": request.temperature,
+        }
+        
+        if request.max_tokens:
+            completion_params["max_tokens"] = request.max_tokens
+
+        if not request.messages:
+            return {
+                "error": "Ошибка валидации запроса",
+                "detail": "Поле messages обязательно для вызова LLM.",
+                "code": "missing_messages",
             }
-            
-            if request.max_tokens:
-                completion_params["max_tokens"] = request.max_tokens
+        completion_params["messages"] = request.messages
 
-            if not request.messages:
-                raise ServiceError(
-                    error="Ошибка валидации запроса",
-                    detail="Поле messages обязательно для вызова LLM.",
-                    status_code=400,
-                    code="missing_messages",
-                )
-            completion_params["messages"] = request.messages
-
-            if request.extra_params:
-                completion_params.update(request.extra_params)
-            
-            logger.info(f"Отправка запроса к модели {request.model}")
-            
-            # Выполняем запрос
-            response = client.chat.completions.create(**completion_params)
-            
-            # Извлекаем ответ
-            if response.choices and len(response.choices) > 0:
+        if request.extra_params:
+            completion_params.update(request.extra_params)
+        
+        max_retry_count = request.max_retry_count or 3
+        last_error: Optional[Exception] = None
+        
+        # Повторяем запрос до max_retry_count раз, пока не найдём answer
+        for attempt in range(max_retry_count):
+            try:
+                logger.info(f"Отправка запроса к модели {request.model} (попытка {attempt + 1}/{max_retry_count})")
+                
+                # Выполняем запрос
+                response = client.chat.completions.create(**completion_params)
+                
+                # Извлекаем ответ
+                if not response.choices or len(response.choices) == 0:
+                    if attempt < max_retry_count - 1:
+                        logger.warning(f"Пустой ответ от провайдера LLM (попытка {attempt + 1}/{max_retry_count})")
+                        last_error = None
+                        continue
+                    else:
+                        return {
+                            "error": "Пустой ответ от провайдера LLM",
+                            "detail": "API вернул ответ без choices.",
+                            "code": "empty_response",
+                        }
+                
                 choice = response.choices[0]
                 content = choice.message.content or ""
+                chat_title: Optional[str] = None
+                chat_summary: Optional[str] = None
+                content_text: Optional[str] = None
                 
-                # Формируем информацию об использовании токенов
-                usage = None
-                if response.usage:
-                    usage = {
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "completion_tokens": response.usage.completion_tokens,
-                        "total_tokens": response.usage.total_tokens
+                # Парсим структурированный ответ
+                try:
+                    text = content.strip()
+                    json_block = re.match(r"^```json\s*\n?(.*)\n?```\s*$", text, re.DOTALL | re.IGNORECASE)
+                    if json_block:
+                        parsed = json.loads(json_block.group(1).strip())
+                    elif text.startswith("{"):
+                        parsed = json.loads(text)
+                    else:
+                        parsed = None
+                    
+                    if isinstance(parsed, dict):
+                        # Извлекаем метаданные диалога
+                        chat_title = parsed.get("chat_title") if isinstance(parsed.get("chat_title"), str) else None
+                        chat_summary = parsed.get("chat_summary") if isinstance(parsed.get("chat_summary"), str) else None
+                        # Извлекаем только answer для сохранения в контекст (без reasoning)
+                        answer = parsed.get("answer")
+                        if isinstance(answer, str) and answer.strip():
+                            content_text = answer
+                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                    logger.debug(f"Ошибка парсинга JSON ответа: {e}")
+                
+                # Если answer найден, возвращаем ответ
+                if content_text:
+                    usage = None
+                    if response.usage:
+                        usage = {
+                            "prompt_tokens": response.usage.prompt_tokens,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "total_tokens": response.usage.total_tokens
+                        }
+                    
+                    logger.info(f"Получен ответ от модели {request.model} с answer (попытка {attempt + 1})")
+                    
+                    result = {"content": content_text}
+                    if chat_title:
+                        result["chat_title"] = chat_title
+                    if chat_summary:
+                        result["chat_summary"] = chat_summary
+                    return result
+                
+                # Если answer не найден и это не последняя попытка, продолжаем цикл
+                if attempt < max_retry_count - 1:
+                    logger.warning(f"Ответ не содержит поле answer, повторная попытка ({attempt + 1}/{max_retry_count})")
+                    last_error = None
+                    continue
+                else:
+                    # Последняя попытка - сохраняем ошибку
+                    last_error = ServiceError(
+                        error="Ответ LLM не содержит обязательное поле answer",
+                        detail=f"После {max_retry_count} попыток не удалось получить поле answer в структурированном ответе. Полученный ответ: {content[:200]}",
+                        status_code=502,
+                        code="missing_answer_field",
+                    )
+                    break
+                    
+            except ServiceError as e:
+                # ServiceError возвращаем как словарь с error (не повторяем)
+                return {
+                    "error": e.error,
+                    "detail": e.detail,
+                    "code": e.code,
+                }
+            except openai.AuthenticationError as e:
+                # Ошибки аутентификации не повторяем
+                logger.error(f"Ошибка аутентификации LLM API: {e}")
+                return {
+                    "error": "Ошибка аутентификации",
+                    "detail": "Неверный или недействительный API-ключ LLM. Проверьте llm_api_key.",
+                    "code": "llm_auth_error",
+                }
+            except openai.RateLimitError as e:
+                # Ошибки лимита не повторяем
+                logger.error(f"Превышен лимит запросов LLM: {e}")
+                return {
+                    "error": "Превышен лимит запросов",
+                    "detail": "Провайдер LLM ограничил частоту запросов. Повторите попытку позже.",
+                    "code": "rate_limit",
+                }
+            except openai.BadRequestError as e:
+                # Ошибки валидации запроса не повторяем
+                logger.error(f"Неверный запрос к LLM API: {e}")
+                return {
+                    "error": "Неверный запрос к LLM",
+                    "detail": f"Провайдер отклонил запрос: {e!s}. Проверьте модель и параметры.",
+                    "code": "bad_request",
+                }
+            except (openai.APIConnectionError, openai.APITimeoutError, openai.OpenAIError) as e:
+                # Ошибки соединения/таймаута/общие ошибки LLM - повторяем, если есть попытки
+                last_error = e
+                if attempt < max_retry_count - 1:
+                    logger.warning(f"Ошибка при запросе к LLM (попытка {attempt + 1}/{max_retry_count}): {e}")
+                    continue
+                else:
+                    # Последняя попытка - возвращаем словарь с error
+                    if isinstance(e, openai.APIConnectionError):
+                        return {
+                            "error": "Ошибка соединения с провайдером",
+                            "detail": f"Не удалось подключиться к LLM API: {e!s}. Проверьте llm_url и доступность сервиса.",
+                            "code": "connection_error",
+                        }
+                    elif isinstance(e, openai.APITimeoutError):
+                        return {
+                            "error": "Таймаут запроса",
+                            "detail": "Провайдер LLM не ответил вовремя. Повторите запрос.",
+                            "code": "timeout",
+                        }
+                    else:
+                        return {
+                            "error": "Ошибка провайдера LLM",
+                            "detail": str(e),
+                            "code": "llm_api_error",
+                        }
+            except Exception as e:
+                # Другие ошибки - повторяем, если есть попытки
+                last_error = e
+                if attempt < max_retry_count - 1:
+                    logger.warning(f"Неожиданная ошибка при запросе к LLM (попытка {attempt + 1}/{max_retry_count}): {e}")
+                    continue
+                else:
+                    logger.exception("Неожиданная ошибка при обращении к LLM")
+                    return {
+                        "error": "Внутренняя ошибка сервера",
+                        "detail": str(e),
+                        "code": "internal_error",
                     }
-                
-                logger.info(f"Получен ответ от модели {request.model}")
-                
-                return AssistantResponse(
-                    content=content,
-                    model=response.model,
-                    usage=usage,
-                    finish_reason=choice.finish_reason
-                )
-            else:
-                raise ServiceError(
-                    error="Пустой ответ от провайдера LLM",
-                    detail="API вернул ответ без choices.",
-                    status_code=502,
-                    code="empty_response",
-                )
-
-        except openai.AuthenticationError as e:
-            logger.error(f"Ошибка аутентификации LLM API: {e}")
-            raise ServiceError(
-                error="Ошибка аутентификации",
-                detail="Неверный или недействительный API-ключ LLM. Проверьте llm_api_key.",
-                status_code=401,
-                code="llm_auth_error",
-            ) from e
-        except openai.RateLimitError as e:
-            logger.error(f"Превышен лимит запросов LLM: {e}")
-            raise ServiceError(
-                error="Превышен лимит запросов",
-                detail="Провайдер LLM ограничил частоту запросов. Повторите попытку позже.",
-                status_code=429,
-                code="rate_limit",
-            ) from e
-        except openai.APIConnectionError as e:
-            logger.error(f"Ошибка соединения с LLM API: {e}")
-            raise ServiceError(
-                error="Ошибка соединения с провайдером",
-                detail=f"Не удалось подключиться к LLM API: {e!s}. Проверьте llm_url и доступность сервиса.",
-                status_code=503,
-                code="connection_error",
-            ) from e
-        except openai.APITimeoutError as e:
-            logger.error(f"Таймаут запроса к LLM: {e}")
-            raise ServiceError(
-                error="Таймаут запроса",
-                detail="Провайдер LLM не ответил вовремя. Повторите запрос.",
-                status_code=504,
-                code="timeout",
-            ) from e
-        except openai.BadRequestError as e:
-            logger.error(f"Неверный запрос к LLM API: {e}")
-            raise ServiceError(
-                error="Неверный запрос к LLM",
-                detail=f"Провайдер отклонил запрос: {e!s}. Проверьте модель и параметры.",
-                status_code=400,
-                code="bad_request",
-            ) from e
-        except openai.OpenAIError as e:
-            logger.error(f"Ошибка OpenAI/LLM API: {e}")
-            status_code = 502
-            if hasattr(e, "response") and e.response is not None:
-                status_code = getattr(e.response, "status_code", 502)
-            raise ServiceError(
-                error="Ошибка провайдера LLM",
-                detail=str(e),
-                status_code=status_code,
-                code="llm_api_error",
-            ) from e
-        except ServiceError:
-            raise
-        except Exception as e:
-            logger.exception("Неожиданная ошибка при обращении к LLM")
-            raise ServiceError(
-                error="Внутренняя ошибка сервера",
-                detail=str(e),
-                status_code=500,
-                code="internal_error",
-            ) from e
+        
+        # Если дошли сюда, значит все попытки исчерпаны
+        if last_error:
+            if isinstance(last_error, ServiceError):
+                return {
+                    "error": last_error.error,
+                    "detail": last_error.detail,
+                    "code": last_error.code,
+                }
+            return {
+                "error": "Не удалось получить ответ от LLM",
+                "detail": f"После {max_retry_count} попыток не удалось получить корректный ответ: {str(last_error)}",
+                "code": "llm_retry_exhausted",
+            }
+        
+        # Если last_error None, но answer не найден - это не должно произойти, но на всякий случай
+        return {
+            "error": "Ответ LLM не содержит обязательное поле answer",
+            "detail": f"После {max_retry_count} попыток не удалось получить поле answer в структурированном ответе.",
+            "code": "missing_answer_field",
+        }
 
 
 def get_llm_service() -> LLMService:

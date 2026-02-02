@@ -23,6 +23,7 @@ class LLMRequest(BaseModel):
     model: Optional[str] = Field("gpt-3.5-turbo", description="Модель для использования")
     temperature: Optional[float] = Field(0.7, description="Температура генерации")
     max_tokens: Optional[int] = Field(None, description="Максимальное количество токенов")
+    max_retry_count: int = Field(3, description="Максимальное количество повторных попыток при отсутствии answer в ответе")
 
     # Основной параметр: список сообщений [{"role": "user"|"assistant"|"system", "content": "..."}]
     messages: Optional[List[Dict[str, Any]]] = Field(None, description="Сообщения чата для контекста и запроса")
@@ -40,9 +41,11 @@ class AssistantRequest(BaseModel):
     """Запрос к ассистенту (тело эндпоинта /generate)."""
     
     current_message: str = Field(..., description="Текущее сообщение пользователя")
-    chat_history: Optional[List[ChatMessage]] = Field(
+    chat_history_irv_id: Optional[str] = Field(
         default=None,
-        description="История чата. Если не пуста — используется она, system_prompt игнорируется; иначе используется system_prompt"
+        description="""UUID версии информационного объекта с файлом, содержащим историю чата. 
+         Если не пусто — используется заданная история чата, system_prompt игнорируется;
+         иначе используется system_prompt"""
     )
     system_prompt: Optional[str] = Field(None, description="Системный промпт (используется только при пустой истории чата)")
     temperature: float = Field(0.2, description="Температура генерации")
@@ -67,7 +70,7 @@ class AssistantRequest(BaseModel):
     vdb_url: Optional[str] = Field(None, description="URL векторной БД")
     
     # Режимы
-    files: Optional[List[str]] = Field("", description="Файлы")
+    file_irv_ids: Optional[List[str]] = Field(None, description="Идентификаторы версий информационных объектов со входными файлами")
     internet: bool = Field(False, description="Использовать интернет")
     knowledge_base: bool = Field(False, description="Использовать базу знаний")
 
@@ -77,11 +80,13 @@ class AssistantRequest(BaseModel):
 
 class AssistantResponse(BaseModel):
     """Ответ от LLM."""
-    
+
     content: str = Field(..., description="Сгенерированный текст")
     model: str = Field(..., description="Использованная модель")
     usage: Optional[Dict[str, Any]] = Field(None, description="Информация об использовании токенов")
     finish_reason: Optional[str] = Field(None, description="Причина завершения генерации")
+    chat_title: Optional[str] = Field(None, description="Заголовок диалога (из структурированного ответа LLM)")
+    chat_summary: Optional[str] = Field(None, description="Краткое описание диалога (из структурированного ответа LLM)")
 
 
 class ValidationErrorItem(BaseModel):

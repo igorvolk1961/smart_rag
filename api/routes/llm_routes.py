@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 
+from api.chat_history import load_chat_history, save_chat_history
 from api.models.llm_models import AssistantRequest, error_response_body
 from api.services.llm_service import get_llm_service, LLMService
 from api.siu_client import SiuClient
@@ -44,7 +45,7 @@ def extract_callback_info(http_request: Request) -> dict[str, Any]:
 
 
 def _normalize_content_to_response(content: str):
-    """
+    """user_post
     Возвращает тело ответа: только content.
     Если content — текст json-объекта в обёртке ```json ... ``` или после strip
     начинается с '{', возвращается распарсенный JSON-объект; иначе — строка content.
@@ -95,8 +96,11 @@ async def generate_response(
         siu_client = SiuClient(base_referer_url, jsessionid)
         context = {}
         context["userInfo"] = siu_client.get_current_user_info()
-        context["userPost"] = context["userInfo"].get("userPost")
-        context["irvInfo"] = siu_client.get_irv_info(request.irv_id)
+        if request.irv_id:
+            context["irvInfo"] = siu_client.get_irv_info(request.irv_id)
+        else:
+            context["irvInfo"] = {}
+        context["chat_messages"] = load_chat_history(siu_client, request.chat_history_irv_id)
 
         if not request.current_message or not request.current_message.strip():
             return JSONResponse(
@@ -113,8 +117,46 @@ async def generate_response(
         else:
             response = await llm_service.agent_call(request, context)
 
+        # Проверяем, есть ли ошибка в ответе
+        if "error" in response:
+            return JSONResponse(
+                status_code=200,
+                content=response,
+            )
+
+        # Если ответ успешен, сохраняем историю чата
+        messages_sent = context.get("messages_sent") or []
+        # В историю сохраняем только answer (без reasoning), который уже извлечён в response.content
+        full_messages = messages_sent + [
+            {"role": "assistant", "content": response.get("content", "") or ""},
+        ]
+        chat_history_result = None
+        try:
+            chat_history_result = save_chat_history(
+                siu_client,
+                chat_history_irv_id=request.chat_history_irv_id,
+                irv_id=request.irv_id,
+                chat_title=response.get("chat_title"),
+                chat_summary=response.get("chat_summary"),
+                full_messages=full_messages,
+            )
+        except ServiceError as e:
+            logger.warning("Сохранение истории чата не выполнено: {} {}", e.error, e.detail)
+        except Exception as e:
+            logger.exception("Ошибка при сохранении истории чата: {}", e)
+
         logger.info("Ответ успешно сгенерирован")
-        body = _normalize_content_to_response(response.content)
+        # Формируем ответ с content и опционально chat_history
+        body = _normalize_content_to_response(response.get("content", ""))
+        if isinstance(body, dict):
+            if chat_history_result:
+                body["chat_history"] = chat_history_result
+        else:
+            # Если body - строка, создаём словарь
+            result_dict = {"content": body}
+            if chat_history_result:
+                result_dict["chat_history"] = chat_history_result
+            body = result_dict
         jsonResponse = JSONResponse(status_code=200, content=body)
         return jsonResponse
 
