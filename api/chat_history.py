@@ -36,9 +36,6 @@ def _extract_nau_id(irv_data: dict) -> Optional[str]:
 
 def _extract_io_id(irv_data: dict) -> Optional[str]:
     """Из объекта версии ИО извлекает id информационного объекта (ioId)."""
-    io_id = irv_data.get("ioId") or irv_data.get("id")
-    if io_id:
-        return str(io_id)
     ir = irv_data.get("ir")
     if isinstance(ir, dict):
         return str(ir["id"]) if ir.get("id") else None
@@ -187,21 +184,16 @@ def save_chat_history(
     full_messages — список сообщений для записи в chat_history.json (включая системный промпт, запрос и ответ).
     
     Returns:
-        Словарь с результатом создания нового ИО (если создавался новый диалог) или None (если обновлялся существующий).
+        Словарь с результатом создания/обновления ИО или None при ошибке.
     """
-    payload = {"messages": full_messages}
-    body_str = json.dumps(payload, ensure_ascii=False)
-
     if chat_history_irv_id and str(chat_history_irv_id).strip():
-        _save_chat_history_update(
+        return _save_chat_history_update(
             siu_client,
             chat_history_irv_id=chat_history_irv_id,
             chat_title=chat_title,
             chat_summary=chat_summary or "",
             full_messages=full_messages,
-            body_str=body_str,
         )
-        return None
     else:
         return _save_chat_history_new(
             siu_client,
@@ -209,7 +201,6 @@ def save_chat_history(
             chat_title=chat_title,
             chat_summary=chat_summary,
             full_messages=full_messages,
-            body_str=body_str,
         )
 
 
@@ -220,7 +211,6 @@ def _save_chat_history_new(
     chat_title: Optional[str],
     chat_summary: Optional[str],
     full_messages: List[dict],
-    body_str: str,
 ) -> Optional[dict]:
     """Создаёт новый ИО диалога в папке «Диалоги с ИИ-помощником» и прикладывает chat_history.json.
     
@@ -259,6 +249,7 @@ def _save_chat_history_new(
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         title = f"{base_title}#{timestamp}"
         summary = (chat_summary or "").strip() or ""
+        body_str = json.dumps({"messages": full_messages}, ensure_ascii=False)
         create_result = siu_client.create_ir(
             irv_name=title,
             parent_folder_id=dialogs_folder_id,
@@ -293,14 +284,17 @@ def _save_chat_history_update(
     chat_title: Optional[str],
     chat_summary: str,
     full_messages: List[dict],
-    body_str: str,
-) -> None:
-    """Читает текущий chat_history.json, дополняет запросом и ответом, создаёт новую версию ИО и записывает файл."""
+) -> Optional[dict]:
+    """Читает текущий chat_history.json, дополняет запросом и ответом, создаёт новую версию ИО и записывает файл.
+    
+    Returns:
+        Словарь с результатом создания новой версии ИО или None при ошибке.
+    """
     try:
         current_irv = siu_client.get_irv(chat_history_irv_id)
         if not isinstance(current_irv, dict):
             logger.warning("save_chat_history (update): get_irv вернул не dict")
-            return
+            return None
         io_id = _extract_io_id(current_irv)
         parent_id = _extract_parent_id(current_irv)
         nau_id = _extract_nau_id(current_irv)
@@ -317,27 +311,10 @@ def _save_chat_history_update(
                 "save_chat_history (update): не удалось извлечь io_id/parent_id/nau_id из ИО версии {}",
                 chat_history_irv_id,
             )
-            return
-        raw_files = siu_client.get_irv_files(chat_history_irv_id)
-        files_list = _files_list(raw_files)
-        file_obj = _find_file_by_name(files_list, CHAT_HISTORY_FILENAME)
-        if file_obj:
-            try:
-                content = siu_client.get_irv_file_content(file_obj)
-                if isinstance(content, (bytes, bytearray)):
-                    content = content.decode("utf-8", errors="replace")
-                if isinstance(content, str):
-                    parsed = json.loads(content)
-                elif isinstance(content, dict):
-                    parsed = content
-                else:
-                    parsed = {}
-                existing_messages = _normalize_messages_from_json(parsed)
-                to_append = full_messages[-2:] if len(full_messages) >= 2 else full_messages
-                merged = existing_messages + to_append
-                body_str = json.dumps({"messages": merged}, ensure_ascii=False)
-            except (json.JSONDecodeError, TypeError, KeyError):
-                pass
+            return None
+        # full_messages уже содержит всю историю (загруженную через load_chat_history + текущий запрос + ответ)
+        # Не нужно повторно читать файл - используем full_messages напрямую
+        body_str = json.dumps({"messages": full_messages}, ensure_ascii=False)
         create_result = siu_client.create_ir(
             irv_name=updated_name,
             parent_folder_id=parent_id,
@@ -349,14 +326,16 @@ def _save_chat_history_update(
         new_irv_id = _extract_irv_id_from_response(create_result)
         if not new_irv_id:
             logger.warning("save_chat_history (update): не удалось извлечь id новой версии ИР")
-            return
+            return None
         raw_files = siu_client.get_irv_files(new_irv_id)
         files_list = _files_list(raw_files)
         file_obj = _find_file_by_name(files_list, CHAT_HISTORY_FILENAME)
         if not file_obj:
             logger.warning("save_chat_history (update): файл {} не найден у новой версии ИР", CHAT_HISTORY_FILENAME)
-            return
+            return None
         siu_client.post_irv_file_content(file_obj, body_str)
+        # Возвращаем результат создания новой версии ИО
+        return create_result if isinstance(create_result, dict) else None
     except ServiceError:
         raise
     except Exception as e:
