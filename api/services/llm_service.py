@@ -17,6 +17,11 @@ from api.models.llm_models import (
     AssistantResponse,
 )
 from api.exceptions import ServiceError
+from api.services.agent_adapter import create_agent_definition_from_request
+from api.agents.agent_factory import AgentFactory
+from api.agents.models import AgentStatesEnum
+import json
+import re
 
 
 class ConfigCache:
@@ -144,16 +149,112 @@ class LLMService:
         self, request: AssistantRequest, context: Optional[Dict[str, Any]] = None
     ) -> dict[str, Any]:
         """
-        Вызов с агентом (интернет и/или база знаний).
-        Реализация будет добавлена отдельно. context передаётся из роута (userPost и др.).
+        Вызов с агентом через sgr-agent-core (интернет и/или база знаний).
+        Streaming используется только внутри агента для передачи данных между фазами.
+        Наружу возвращается финальный результат после завершения всех потоков агента.
+        Агент работает в изолированном контексте - получает только текущее сообщение пользователя,
+        без истории чата. История чата сохраняется после получения ответа от агента.
+        context передаётся из роута (userPost и др.).
         Возвращает словарь с полем content или error.
         """
         context = context or {}
-        return {
-            "error": "Метод не реализован",
-            "detail": "agent_call: реализация будет обсуждена отдельно (internet/knowledge_base)",
-            "code": "not_implemented",
-        }
+        
+        try:
+            # Создаем AgentDefinition из request
+            agent_def = create_agent_definition_from_request(request, context)
+            
+            # Агент работает в изолированном контексте - передаем только текущее сообщение
+            task_messages = [{"role": "user", "content": request.current_message}]
+            
+            # Сохраняем только текущее сообщение для последующего сохранения истории
+            context["messages_sent"] = task_messages
+            
+            # Создаем агента
+            agent = await AgentFactory.create(agent_def, task_messages)
+            
+            # Передаем file_irv_ids и другие параметры в custom_context агента для использования в RAGTool
+            if request.file_irv_ids or request.vdb_url:
+                agent._context.custom_context = {
+                    "file_irv_ids": request.file_irv_ids,
+                    "vdb_url": request.vdb_url,
+                }
+            
+            # Запускаем агента и ждем завершения выполнения
+            # Streaming используется только внутри агента для передачи данных между reasoning и action фазами
+            execution_result = await agent.execute()
+            
+            # Проверяем состояние агента
+            if agent._context.state == AgentStatesEnum.COMPLETED:
+                # Агент успешно завершил работу
+                final_answer = agent._context.execution_result or execution_result or ""
+                
+                # Извлекаем chat_title и chat_summary из финального ответа, если возможно
+                # (можно попробовать распарсить структурированный ответ, как в generate_response)
+                chat_title = None
+                chat_summary = None
+                
+                # Пытаемся извлечь структурированные данные из ответа
+                try:
+                    text = final_answer.strip()
+                    json_block = re.match(r"^```json\s*\n?(.*)\n?```\s*$", text, re.DOTALL | re.IGNORECASE)
+                    if json_block:
+                        parsed = json.loads(json_block.group(1).strip())
+                    elif text.startswith("{"):
+                        parsed = json.loads(text)
+                    else:
+                        parsed = None
+                    
+                    if isinstance(parsed, dict):
+                        chat_title = parsed.get("chat_title")
+                        chat_summary = parsed.get("chat_summary")
+                        # Если есть answer, используем его вместо полного ответа
+                        answer = parsed.get("answer")
+                        if isinstance(answer, str) and answer.strip():
+                            final_answer = answer
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    pass
+                
+                result = {"content": final_answer}
+                if chat_title:
+                    result["chat_title"] = chat_title
+                if chat_summary:
+                    result["chat_summary"] = chat_summary
+                
+                return result
+            elif agent._context.state == AgentStatesEnum.FAILED:
+                return {
+                    "error": "Агент завершил работу с ошибкой",
+                    "detail": agent._context.execution_result or "Неизвестная ошибка",
+                    "code": "agent_failed",
+                }
+            else:
+                return {
+                    "error": "Агент не завершил работу",
+                    "detail": f"Состояние агента: {agent._context.state}",
+                    "code": "agent_incomplete",
+                }
+            
+        except ValueError as e:
+            logger.error(f"Ошибка создания агента: {e}")
+            return {
+                "error": "Ошибка создания агента",
+                "detail": str(e),
+                "code": "agent_creation_error",
+            }
+        except RuntimeError as e:
+            logger.error(f"Ошибка выполнения агента: {e}")
+            return {
+                "error": "Ошибка выполнения агента",
+                "detail": str(e),
+                "code": "agent_execution_error",
+            }
+        except Exception as e:
+            logger.exception("Ошибка при вызове агента")
+            return {
+                "error": "Ошибка при вызове агента",
+                "detail": str(e),
+                "code": "agent_error",
+            }
 
     async def generate_response(
         self,

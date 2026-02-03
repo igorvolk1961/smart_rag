@@ -127,11 +127,12 @@ async def generate_response(
             )
 
         # Если ответ успешен, сохраняем историю чата
-        messages_sent = context.get("messages_sent") or []
+        # Формируем полную историю: загруженная история + текущее сообщение + ответ ассистента
+        chat_messages = context.get("chat_messages") or []
+        current_message = {"role": "user", "content": request.current_message}
+        assistant_message = {"role": "assistant", "content": response.get("content", "") or ""}
         # В историю сохраняем только answer (без reasoning), который уже извлечён в response.content
-        full_messages = messages_sent + [
-            {"role": "assistant", "content": response.get("content", "") or ""},
-        ]
+        full_messages = chat_messages + [current_message, assistant_message]
         chat_history_result = None
         try:
             chat_history_result = save_chat_history(
