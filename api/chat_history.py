@@ -249,7 +249,7 @@ def _save_chat_history_new(
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         title = f"{base_title}#{timestamp}"
         summary = (chat_summary or "").strip() or ""
-        body_str = json.dumps({"messages": full_messages}, ensure_ascii=False)
+        body_str = json.dumps({"messages": full_messages}, ensure_ascii=False, indent=2)
         create_result = siu_client.create_ir(
             irv_name=title,
             parent_folder_id=dialogs_folder_id,
@@ -314,7 +314,7 @@ def _save_chat_history_update(
             return None
         # full_messages уже содержит всю историю (загруженную через load_chat_history + текущий запрос + ответ)
         # Не нужно повторно читать файл - используем full_messages напрямую
-        body_str = json.dumps({"messages": full_messages}, ensure_ascii=False)
+        body_str = json.dumps({"messages": full_messages}, ensure_ascii=False, indent=2)
         create_result = siu_client.create_ir(
             irv_name=updated_name,
             parent_folder_id=parent_id,
