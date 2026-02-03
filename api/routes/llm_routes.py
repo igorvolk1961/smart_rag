@@ -100,7 +100,9 @@ async def generate_response(
             context["irvInfo"] = siu_client.get_irv_info(request.irv_id)
         else:
             context["irvInfo"] = {}
-        context["chat_messages"] = load_chat_history(siu_client, request.chat_history_irv_id)
+        chat_messages, irv_exists = load_chat_history(siu_client, request.chat_history_irv_id)
+        context["chat_messages"] = chat_messages
+        context["chat_history_irv_exists"] = irv_exists
 
         if not request.current_message or not request.current_message.strip():
             return JSONResponse(
@@ -139,6 +141,8 @@ async def generate_response(
                 chat_title=response.get("chat_title"),
                 chat_summary=response.get("chat_summary"),
                 full_messages=full_messages,
+                irv_exists=context.get("chat_history_irv_exists", False),
+                has_messages=bool(context.get("chat_messages")),
             )
         except ServiceError as e:
             logger.warning("Сохранение истории чата не выполнено: {} {}", e.error, e.detail)

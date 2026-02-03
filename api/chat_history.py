@@ -83,25 +83,38 @@ def _normalize_messages_from_json(parsed: Any) -> List[dict]:
     return []
 
 
-def load_chat_history(siu_client: Any, chat_history_irv_id: Optional[str]) -> Optional[List[dict]]:
+def load_chat_history(siu_client: Any, chat_history_irv_id: Optional[str]) -> tuple[Optional[List[dict]], bool]:
     """
     Загружает историю чата из файла chat_history.json, приложенного к версии ИО с id chat_history_irv_id.
 
-    Возвращает список сообщений для контекста LLM [{role, content}] или None, если идентификатор не задан
-    или файл не найден/не удалось распарсить.
+    Возвращает кортеж (messages, irv_exists):
+    - messages: список сообщений для контекста LLM [{role, content}] или None (если файл не найден или пуст)
+    - irv_exists: True если ИО существует (признак того, что нужно создавать новую версию)
+    
+    Если идентификатор не задан, возвращает (None, False).
     """
     if not chat_history_irv_id or not str(chat_history_irv_id).strip():
-        return None
+        return (None, False)
     try:
+        # Сначала проверяем существование ИО
+        irv = siu_client.get_irv(chat_history_irv_id)
+        irv_exists = isinstance(irv, dict)
+        if not irv_exists:
+            logger.warning("ИО версии {} не существует", chat_history_irv_id)
+            return (None, False)
+        
+        # Проверяем наличие файла
         raw_files = siu_client.get_irv_files(chat_history_irv_id)
         files_list = _files_list(raw_files)
         file_obj = _find_file_by_name(files_list, CHAT_HISTORY_FILENAME)
         if not file_obj:
             logger.warning("Файл {} не найден у ИО версии {}", CHAT_HISTORY_FILENAME, chat_history_irv_id)
-            return None
+            return (None, True)
+        
+        # Загружаем содержимое файла
         content = siu_client.get_irv_file_content(file_obj)
         if content is None:
-            return None
+            return (None, True)
         if isinstance(content, (bytes, bytearray)):
             content = content.decode("utf-8", errors="replace")
         if isinstance(content, dict):
@@ -113,20 +126,20 @@ def load_chat_history(siu_client: Any, chat_history_irv_id: Optional[str]) -> Op
                 parsed = json.loads(content)
             except json.JSONDecodeError:
                 logger.warning("Не удалось распарсить {} как JSON", CHAT_HISTORY_FILENAME)
-                return None
+                return (None, True)
         elif isinstance(content, dict):
             parsed = content
         else:
-            return None
+            return (None, True)
         messages = _normalize_messages_from_json(parsed)
         if not messages:
-            return None
-        return messages
+            return (None, True)
+        return (messages, True)
     except ServiceError:
         raise
     except Exception as e:
         logger.warning("Ошибка загрузки истории чата: {}", e)
-        return None
+        return (None, False)
 
 
 def _extract_irv_id_from_response(raw: Any) -> Optional[str]:
@@ -176,23 +189,28 @@ def save_chat_history(
     chat_title: Optional[str],
     chat_summary: Optional[str],
     full_messages: List[dict],
+    irv_exists: bool = False,
+    has_messages: bool = False,
 ) -> Optional[dict]:
     """
     Сохраняет историю чата в СИУ: либо создаёт новый ИО с файлом chat_history.json в папке
     «Диалоги с ИИ-помощником», либо дополняет существующий файл и создаёт новую версию ИО.
 
     full_messages — список сообщений для записи в chat_history.json (включая системный промпт, запрос и ответ).
+    irv_exists — существует ли ИО (признак того, что нужно создавать новую версию).
+    has_messages — были ли загружены сообщения из истории (признак того, как формировать имя ИО).
     
     Returns:
         Словарь с результатом создания/обновления ИО или None при ошибке.
     """
-    if chat_history_irv_id and str(chat_history_irv_id).strip():
+    if chat_history_irv_id and str(chat_history_irv_id).strip() and irv_exists:
         return _save_chat_history_update(
             siu_client,
             chat_history_irv_id=chat_history_irv_id,
             chat_title=chat_title,
             chat_summary=chat_summary or "",
             full_messages=full_messages,
+            has_messages=has_messages,
         )
     else:
         return _save_chat_history_new(
@@ -261,11 +279,28 @@ def _save_chat_history_new(
         if not new_irv_id:
             logger.warning("save_chat_history: не удалось извлечь id созданного ИР из ответа create_ir")
             return None
-        raw_files = siu_client.get_irv_files(new_irv_id)
-        files_list = _files_list(raw_files)
+        # Используем get_irv с with_files=True для получения информации о файлах
+        new_irv = siu_client.get_irv(new_irv_id, with_files=True)
+        if not isinstance(new_irv, dict):
+            logger.warning("save_chat_history (new): get_irv вернул не dict для созданного ИР")
+            return None
+        # Извлекаем файлы из ответа get_irv
+        files_attr = new_irv.get("attrMap", {})
+        if not isinstance(files_attr, dict):
+            logger.warning("save_chat_history (new): attrMap не найден или не является dict")
+            return None
+        files_value = files_attr.get("Файлы", {})
+        if not isinstance(files_value, dict):
+            logger.warning("save_chat_history (new): поле 'Файлы' не найдено или не является dict")
+            return None
+        files_data = files_value.get("value", [])
+        if not isinstance(files_data, list):
+            logger.warning("save_chat_history (new): value поля 'Файлы' не является list")
+            return None
+        files_list = _files_list(files_data)
         file_obj = _find_file_by_name(files_list, CHAT_HISTORY_FILENAME)
         if not file_obj:
-            logger.warning("save_chat_history: файл {} не найден у созданного ИР {}", CHAT_HISTORY_FILENAME, new_irv_id)
+            logger.warning("save_chat_history (new): файл {} не найден у созданного ИР {}", CHAT_HISTORY_FILENAME, new_irv_id)
             return None
         siu_client.post_irv_file_content(file_obj, body_str)
         # Возвращаем результат создания ИО
@@ -284,8 +319,11 @@ def _save_chat_history_update(
     chat_title: Optional[str],
     chat_summary: str,
     full_messages: List[dict],
+    has_messages: bool = False,
 ) -> Optional[dict]:
-    """Читает текущий chat_history.json, дополняет запросом и ответом, создаёт новую версию ИО и записывает файл.
+    """Создаёт новую версию ИО и записывает файл chat_history.json.
+    
+    has_messages — были ли загружены сообщения из истории (если False, имя ИО формируется как для нового).
     
     Returns:
         Словарь с результатом создания новой версии ИО или None при ошибке.
@@ -298,14 +336,6 @@ def _save_chat_history_update(
         io_id = _extract_io_id(current_irv)
         parent_id = _extract_parent_id(current_irv)
         nau_id = _extract_nau_id(current_irv)
-        existing_name = current_irv.get("name") or (current_irv.get("description", "")) or "Диалог"
-        # Извлекаем базовое имя (без timestamp) и добавляем новый timestamp
-        if "#" in existing_name:
-            base_name = existing_name.rsplit("#", 1)[0]
-        else:
-            base_name = existing_name
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        updated_name = f"{base_name}#{timestamp}"
         if not io_id or not parent_id or not nau_id:
             logger.warning(
                 "save_chat_history (update): не удалось извлечь io_id/parent_id/nau_id из ИО версии {}",
@@ -313,8 +343,24 @@ def _save_chat_history_update(
             )
             return None
         # full_messages уже содержит всю историю (загруженную через load_chat_history + текущий запрос + ответ)
-        # Не нужно повторно читать файл - используем full_messages напрямую
         body_str = json.dumps({"messages": full_messages}, ensure_ascii=False, indent=2)
+        if has_messages:
+            # Файл существует - создаём новую версию ИО с обновлённым файлом
+            # Название формируется из существующего имени с новым timestamp
+            existing_name = current_irv.get("name") or (current_irv.get("description", "")) or "Диалог"
+            if "#" in existing_name:
+                base_name = existing_name.rsplit("#", 1)[0]
+            else:
+                base_name = existing_name
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            updated_name = f"{base_name}#{timestamp}"
+        else:
+            # Файл отсутствует - создаём новую версию ИО с файлом
+            # Название формируется как при создании нового ИО (chat_title#timestamp)
+            base_title = (chat_title or "").strip() or (full_messages[0].get("content", "")[:80] if full_messages else "Диалог")
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            updated_name = f"{base_title}#{timestamp}"
+        
         create_result = siu_client.create_ir(
             irv_name=updated_name,
             parent_folder_id=parent_id,
@@ -327,8 +373,25 @@ def _save_chat_history_update(
         if not new_irv_id:
             logger.warning("save_chat_history (update): не удалось извлечь id новой версии ИР")
             return None
-        raw_files = siu_client.get_irv_files(new_irv_id)
-        files_list = _files_list(raw_files)
+        # Используем get_irv с with_files=True для получения информации о файлах
+        new_irv = siu_client.get_irv(new_irv_id, with_files=True)
+        if not isinstance(new_irv, dict):
+            logger.warning("save_chat_history (update): get_irv вернул не dict для новой версии ИР")
+            return None
+        # Извлекаем файлы из ответа get_irv
+        files_attr = new_irv.get("attrMap", {})
+        if not isinstance(files_attr, dict):
+            logger.warning("save_chat_history (update): attrMap не найден или не является dict")
+            return None
+        files_value = files_attr.get("Файлы", {})
+        if not isinstance(files_value, dict):
+            logger.warning("save_chat_history (update): поле 'Файлы' не найдено или не является dict")
+            return None
+        files_data = files_value.get("value", [])
+        if not isinstance(files_data, list):
+            logger.warning("save_chat_history (update): value поля 'Файлы' не является list")
+            return None
+        files_list = _files_list(files_data)
         file_obj = _find_file_by_name(files_list, CHAT_HISTORY_FILENAME)
         if not file_obj:
             logger.warning("save_chat_history (update): файл {} не найден у новой версии ИР", CHAT_HISTORY_FILENAME)
