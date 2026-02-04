@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 from qdrant_client.models import Filter, FieldCondition, MatchValue, PointIdsList, PointStruct
@@ -29,6 +29,11 @@ from api.siu_client import SiuClient
 
 class RAGService:
     """Сервис для управления файлами в RAG-системе."""
+    
+    # Кэш для переиспользуемых компонентов
+    _embedding_cache: Dict[str, Any] = {}
+    _vector_store_cache: Dict[str, Any] = {}
+    _config_cache: Any = None
 
     def add_files_to_rag(self, request: RAGRequest, siu_client: SiuClient) -> Dict[str, Any]:
         """
@@ -201,6 +206,67 @@ class RAGService:
             logger.exception(f"Ошибка при удалении файлов из RAG: {e}")
             raise
 
+    def _filter_attr_map_metadata(self, attr_map: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Фильтрация метаданных из attrMap по заданным правилам.
+        
+        Args:
+            attr_map: Словарь метаданных, где ключ - название, значение - словарь с полями meta и value
+            
+        Returns:
+            Отфильтрованный словарь метаданных
+        """
+        filtered_metadata = {}
+        
+        if not isinstance(attr_map, dict):
+            return filtered_metadata
+        
+        # Исключаемые названия метаданных
+        excluded_names = {
+            "Настройка доступа к базе знаний",
+            "Действие в базе знаний"
+        }
+        
+        # Допустимые значения id
+        allowed_ids = set(range(1, 8)) | {11}  # 1-7 и 11
+        
+        for attr_name, attr_data in attr_map.items():
+            # Пропускаем исключенные названия
+            if attr_name in excluded_names:
+                continue
+            
+            if not isinstance(attr_data, dict):
+                continue
+            
+            # Извлекаем id из структуры meta.typeMeta.id
+            meta = attr_data.get("meta")
+            if not isinstance(meta, dict):
+                continue
+            
+            type_meta = meta.get("typeMeta")
+            if not isinstance(type_meta, dict):
+                continue
+            
+            attr_id = type_meta.get("id")
+            if attr_id not in allowed_ids:
+                continue
+            
+            # Извлекаем value
+            value = attr_data.get("value")
+            
+            # Если id=4, то value - словарь, используем поле name
+            if attr_id == 4:
+                if isinstance(value, dict):
+                    value = value.get("name")
+                else:
+                    continue  # Пропускаем, если value не словарь для id=4
+            
+            # Добавляем метаданные
+            if value is not None:
+                filtered_metadata[attr_name] = value
+        
+        return filtered_metadata
+    
     def _extract_irv_metadata(self, irv_info: Any, irv_id: str) -> Dict[str, Any]:
         """Извлечение метаданных ИО из ответа get_irv."""
         irv_metadata = {}
@@ -212,15 +278,11 @@ class RAGService:
                 "irv_description": irv_info.get("description"),
             }
             
-            # Добавляем метаданные, если они есть
-            if "meta" in irv_info and isinstance(irv_info["meta"], dict):
-                irv_metadata["irv_meta"] = irv_info["meta"]
-            elif "metadata" in irv_info and isinstance(irv_info["metadata"], dict):
-                irv_metadata["irv_metadata"] = irv_info["metadata"]
-            elif "data" in irv_info and isinstance(irv_info["data"], dict):
-                meta_data = irv_info["data"].get("meta", {})
-                if meta_data:
-                    irv_metadata["irv_meta"] = meta_data
+            # Добавляем метаданные из attrMap с фильтрацией
+            if "attrMap" in irv_info and isinstance(irv_info["attrMap"], dict):
+                filtered_attrs = self._filter_attr_map_metadata(irv_info["attrMap"])
+                if filtered_attrs:
+                    irv_metadata["irv_attrs"] = filtered_attrs
             
             # Удаляем None значения
             irv_metadata = {k: v for k, v in irv_metadata.items() if v is not None}
@@ -243,7 +305,7 @@ class RAGService:
             files_list = []
         
         # Фильтрация файлов по расширению (docx и txt)
-        supported_extensions = {".docx", ".txt"}
+        supported_extensions = {".docx", ".txt", ".md"}
         files_to_process = []
         for file_item in files_list:
             # Нормализация элемента файла
@@ -269,61 +331,124 @@ class RAGService:
         
         return files_to_process
 
-    def _initialize_rag_components(self, request: RAGRequest, chunker_output_dir: str):
-        """Инициализация компонентов RAG (chunker, embedding, vector_store)."""
-        from rag.chunker_integration import ChunkerIntegration
+    def _get_cached_config(self):
+        """Получение конфигурации с кэшированием."""
+        if RAGService._config_cache is None:
+            from utils.config import get_config
+            RAGService._config_cache = get_config()
+        return RAGService._config_cache
+    
+    def _get_cached_embedding(self, embed_api_key: Optional[str] = None, embed_url: Optional[str] = None, embed_model_name: Optional[str] = None):
+        """
+        Получение объекта эмбеддингов с кэшированием.
+        
+        Args:
+            embed_api_key: API ключ для эмбеддингов (если None, берется из переменной окружения)
+            embed_url: URL API эмбеддингов (если None, берется из конфигурации)
+            embed_model_name: Модель эмбеддингов (если None, берется из конфигурации)
+        """
         from rag.giga_embeddings import GigaEmbedding
-        from rag.vector_store import QdrantVectorStoreManager
-        from utils.config import get_config
         
-        # Загрузка конфигурации
-        config = get_config()
-        
-        # Инициализация компонентов RAG
-        chunker_config = config.get("chunker", {})
-        qdrant_config = config.get("qdrant", {})
+        config = self._get_cached_config()
         embeddings_config = config.get("embeddings", {}).get("giga", {})
         
-        # Инициализация chunker
+        # Определяем параметры: приоритет у параметров из запроса, затем конфигурация, затем переменные окружения
+        final_api_key = embed_api_key or os.getenv("GIGACHAT_AUTH_KEY")
+        if not final_api_key:
+            raise ServiceError(
+                error="Не настроен API ключ для эмбеддингов",
+                detail="API ключ не указан в запросе и переменная окружения GIGACHAT_AUTH_KEY не установлена",
+                code="missing_embed_api_key",
+            )
+        
+        final_api_url = embed_url or embeddings_config.get("api_url", "https://gigachat.devices.sberbank.ru/api/v1")
+        final_model = embed_model_name or embeddings_config.get("model", "Embeddings")
+        final_scope = embeddings_config.get("scope", "GIGACHAT_API_PERS")
+        batch_size = embeddings_config.get("batch_size", 10)
+        max_retries = embeddings_config.get("max_retries", 3)
+        timeout = embeddings_config.get("timeout", 60)
+        
+        # Создаем ключ кэша на основе параметров
+        cache_key = f"{final_api_url}:{final_model}:{final_scope}:{batch_size}:{max_retries}:{timeout}"
+        # Не включаем api_key в ключ кэша для безопасности, но используем его при создании объекта
+        
+        if cache_key not in RAGService._embedding_cache:
+            embedding = GigaEmbedding(
+                auth_key=final_api_key,
+                scope=final_scope,
+                api_url=final_api_url,
+                model=final_model,
+                batch_size=batch_size,
+                max_retries=max_retries,
+                timeout=timeout
+            )
+            RAGService._embedding_cache[cache_key] = embedding
+            logger.debug(f"Создан новый объект GigaEmbedding для {final_api_url}/{final_model} (кэширован)")
+        
+        return RAGService._embedding_cache[cache_key]
+    
+    def _get_cached_vector_store(self, vdb_url: str, collection_name: str, vector_size: int, timeout: int, api_key: str = None):
+        """Получение объекта векторного хранилища с кэшированием по ключу vdb_url."""
+        # Нормализация URL для использования в качестве ключа кэша
+        normalized_url = vdb_url.strip().rstrip("/")
+        if not normalized_url.startswith("http"):
+            normalized_url = f"http://{normalized_url}"
+        
+        cache_key = f"{normalized_url}:{collection_name}:{vector_size}"
+        
+        if cache_key not in RAGService._vector_store_cache:
+            from rag.vector_store import QdrantVectorStoreManager
+            
+            vector_store_manager = QdrantVectorStoreManager(
+                url=normalized_url,
+                api_key=api_key,
+                collection_name=collection_name,
+                vector_size=vector_size,
+                timeout=timeout
+            )
+            
+            # Убеждаемся, что коллекция существует (только при первом создании)
+            vector_store_manager.ensure_collection_exists()
+            
+            RAGService._vector_store_cache[cache_key] = vector_store_manager
+            logger.debug(f"Создан новый объект QdrantVectorStoreManager для {normalized_url} (кэширован)")
+        
+        return RAGService._vector_store_cache[cache_key]
+    
+    def _initialize_rag_components(self, request: RAGRequest, chunker_output_dir: str):
+        """Инициализация компонентов RAG (chunker, embedding, vector_store) с кэшированием."""
+        from rag.chunker_integration import ChunkerIntegration
+        
+        # Загрузка конфигурации (кэшируется)
+        config = self._get_cached_config()
+        
+        # Инициализация chunker (не кэшируется, так как зависит от chunker_output_dir)
+        chunker_config = config.get("chunker", {})
         chunker = ChunkerIntegration(
             chunker_config_path=chunker_config.get("config_path", "smartchanker_config.json"),
             output_dir=chunker_output_dir
         )
         
-        # Инициализация эмбеддингов
-        embed_api_key = os.getenv("GIGACHAT_AUTH_KEY")
-        if not embed_api_key:
-            raise ServiceError(
-                error="Не настроен API ключ для эмбеддингов",
-                detail="Переменная окружения GIGACHAT_AUTH_KEY не установлена",
-                code="missing_embed_api_key",
-            )
-        
-        embedding = GigaEmbedding(
-            auth_key=embed_api_key,
-            scope=embeddings_config.get("scope", "GIGACHAT_API_PERS"),
-            api_url=embeddings_config.get("api_url", "https://gigachat.devices.sberbank.ru/api/v1"),
-            model=embeddings_config.get("model", "Embeddings"),
-            batch_size=embeddings_config.get("batch_size", 10),
-            max_retries=embeddings_config.get("max_retries", 3),
-            timeout=embeddings_config.get("timeout", 60)
+        # Инициализация эмбеддингов (кэшируется с учетом параметров из запроса)
+        embedding = self._get_cached_embedding(
+            embed_api_key=getattr(request, 'embed_api_key', None),
+            embed_url=getattr(request, 'embed_url', None),
+            embed_model_name=getattr(request, 'embed_model_name', None)
         )
         
-        # Инициализация векторного хранилища
+        # Инициализация векторного хранилища (кэшируется по vdb_url)
+        qdrant_config = config.get("qdrant", {})
         vdb_url = request.vdb_url.strip().rstrip("/")
         if not vdb_url.startswith("http"):
             vdb_url = f"http://{vdb_url}"
         
-        vector_store_manager = QdrantVectorStoreManager(
-            url=vdb_url,
-            api_key=qdrant_config.get("api_key"),
+        vector_store_manager = self._get_cached_vector_store(
+            vdb_url=vdb_url,
             collection_name=qdrant_config.get("collection_name", "smart_rag_documents"),
             vector_size=qdrant_config.get("vector_size", 1024),
-            timeout=qdrant_config.get("timeout", 30)
+            timeout=qdrant_config.get("timeout", 30),
+            api_key=qdrant_config.get("api_key")
         )
-        
-        # Убеждаемся, что коллекция существует
-        vector_store_manager.ensure_collection_exists()
         
         return chunker, embedding, vector_store_manager
 
@@ -556,6 +681,11 @@ class RAGService:
         Returns:
             Словарь со списком коллекций
         """
+        # Инициализация векторного хранилища (выносим за try для использования в except)
+        vdb_url = request.vdb_url.strip().rstrip("/")
+        if not vdb_url.startswith("http"):
+            vdb_url = f"http://{vdb_url}"
+        
         try:
             from rag.vector_store import QdrantVectorStoreManager
             from utils.config import get_config
@@ -563,11 +693,6 @@ class RAGService:
             # Загрузка конфигурации
             config = get_config()
             qdrant_config = config.get("qdrant", {})
-            
-            # Инициализация векторного хранилища
-            vdb_url = request.vdb_url.strip().rstrip("/")
-            if not vdb_url.startswith("http"):
-                vdb_url = f"http://{vdb_url}"
             
             # Создаем временный менеджер для подключения к Qdrant
             vector_store_manager = QdrantVectorStoreManager(
@@ -643,9 +768,35 @@ class RAGService:
                 total=len(collections_info)
             ).model_dump()
             
-        except Exception as e:
-            logger.exception(f"Ошибка при получении списка коллекций: {e}")
+        except ServiceError:
+            # Пробрасываем ServiceError как есть
             raise
+        except Exception as e:
+            error_message = str(e)
+            error_type = type(e).__name__
+            
+            # Проверяем тип ошибки подключения
+            if "timeout" in error_message.lower() or "Timeout" in error_type:
+                logger.error(f"Таймаут подключения к Qdrant на {vdb_url}: {e}")
+                raise ServiceError(
+                    error="Qdrant недоступен",
+                    detail=f"Таймаут подключения к Qdrant серверу на {vdb_url}. Убедитесь, что сервер запущен и доступен.",
+                    code="qdrant_timeout"
+                )
+            elif "connection" in error_message.lower() or "Connection" in error_type or "connect" in error_message.lower():
+                logger.error(f"Ошибка подключения к Qdrant на {vdb_url}: {e}")
+                raise ServiceError(
+                    error="Qdrant недоступен",
+                    detail=f"Не удалось подключиться к Qdrant серверу на {vdb_url}. Убедитесь, что сервер запущен.",
+                    code="qdrant_connection_error"
+                )
+            else:
+                logger.exception(f"Ошибка при получении списка коллекций: {e}")
+                raise ServiceError(
+                    error="Ошибка при работе с Qdrant",
+                    detail=f"Ошибка при получении списка коллекций: {error_message}",
+                    code="qdrant_error"
+                )
 
     def delete_collection(self, request: CollectionDeleteRequest) -> Dict[str, Any]:
         """
@@ -657,6 +808,11 @@ class RAGService:
         Returns:
             Словарь с результатом удаления коллекции
         """
+        # Инициализация векторного хранилища (выносим за try для использования в except)
+        vdb_url = request.vdb_url.strip().rstrip("/")
+        if not vdb_url.startswith("http"):
+            vdb_url = f"http://{vdb_url}"
+        
         try:
             from rag.vector_store import QdrantVectorStoreManager
             from utils.config import get_config
@@ -664,11 +820,6 @@ class RAGService:
             # Загрузка конфигурации
             config = get_config()
             qdrant_config = config.get("qdrant", {})
-            
-            # Инициализация векторного хранилища
-            vdb_url = request.vdb_url.strip().rstrip("/")
-            if not vdb_url.startswith("http"):
-                vdb_url = f"http://{vdb_url}"
             
             # Создаем менеджер с указанной коллекцией для удаления
             vector_store_manager = QdrantVectorStoreManager(
@@ -707,6 +858,32 @@ class RAGService:
                 message=f"Коллекция '{request.collection_name}' успешно удалена"
             ).model_dump()
             
-        except Exception as e:
-            logger.exception(f"Ошибка при удалении коллекции: {e}")
+        except ServiceError:
+            # Пробрасываем ServiceError как есть
             raise
+        except Exception as e:
+            error_message = str(e)
+            error_type = type(e).__name__
+            
+            # Проверяем тип ошибки подключения
+            if "timeout" in error_message.lower() or "Timeout" in error_type:
+                logger.error(f"Таймаут подключения к Qdrant на {vdb_url}: {e}")
+                raise ServiceError(
+                    error="Qdrant недоступен",
+                    detail=f"Таймаут подключения к Qdrant серверу на {vdb_url}. Убедитесь, что сервер запущен и доступен.",
+                    code="qdrant_timeout"
+                )
+            elif "connection" in error_message.lower() or "Connection" in error_type or "connect" in error_message.lower():
+                logger.error(f"Ошибка подключения к Qdrant на {vdb_url}: {e}")
+                raise ServiceError(
+                    error="Qdrant недоступен",
+                    detail=f"Не удалось подключиться к Qdrant серверу на {vdb_url}. Убедитесь, что сервер запущен.",
+                    code="qdrant_connection_error"
+                )
+            else:
+                logger.exception(f"Ошибка при удалении коллекции: {e}")
+                raise ServiceError(
+                    error="Ошибка при работе с Qdrant",
+                    detail=f"Ошибка при удалении коллекции: {error_message}",
+                    code="qdrant_error"
+                )

@@ -103,6 +103,11 @@ class RAGRequest(BaseModel):
     vdb_url: str = Field(..., description="URL векторной базы данных")
     irv_id: str = Field(..., description="Идентификатор версии информационного объекта")
     action: str = Field(..., description="Действие: 'add' - добавить файлы, 'remove' - удалить файлы")
+    
+    # Параметры эмбеддингов (опционально, если не указаны - используются из конфигурации)
+    embed_api_key: Optional[str] = Field(None, description="API ключ для эмбеддингов")
+    embed_url: Optional[str] = Field(None, description="URL API эмбеддингов")
+    embed_model_name: Optional[str] = Field(None, description="Модель эмбеддингов")
 
 
 class RAGAddResponse(BaseModel):
@@ -161,6 +166,20 @@ class CollectionDeleteResponse(BaseModel):
     success: bool = Field(..., description="Успешность операции")
     collection_name: str = Field(..., description="Имя удаленной коллекции")
     message: str = Field(..., description="Сообщение о результате операции")
+
+
+class QdrantHealthCheckRequest(BaseModel):
+    """Запрос для проверки доступности Qdrant."""
+    
+    vdb_url: str = Field(..., description="URL векторной базы данных")
+
+
+class QdrantHealthCheckResponse(BaseModel):
+    """Ответ при проверке доступности Qdrant."""
+    
+    available: bool = Field(..., description="Доступен ли Qdrant сервер")
+    message: Optional[str] = Field(None, description="Сообщение о статусе")
+    version: Optional[str] = Field(None, description="Версия Qdrant (если доступна)")
 
 
 class ErrorResponse(BaseModel):

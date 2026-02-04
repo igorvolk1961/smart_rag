@@ -18,6 +18,8 @@ from api.models.llm_models import (
     RAGRequest,
     CollectionListRequest,
     CollectionDeleteRequest,
+    QdrantHealthCheckRequest,
+    QdrantHealthCheckResponse,
 )
 from api.services.llm_service import get_llm_service, LLMService
 from api.services.rag_service import RAGService
@@ -319,41 +321,109 @@ async def manage_rag_files(
         )
 
 
-@router.get(
+@router.post(
+    "/rag/health",
+    summary="Проверка доступности Qdrant",
+    description="Быстрая проверка доступности Qdrant сервера без выполнения операций с данными"
+)
+async def check_qdrant_health(
+    request: QdrantHealthCheckRequest,
+) -> JSONResponse:
+    """
+    Проверка доступности Qdrant сервера.
+    
+    Args:
+        request: Запрос с параметром vdb_url (тело запроса)
+        
+    Returns:
+        Статус доступности Qdrant
+    """
+    try:
+        logger.info(f"Получен запрос на проверку доступности Qdrant: vdb_url={request.vdb_url}")
+        
+        from rag.vector_store import QdrantVectorStoreManager
+        from utils.config import get_config
+        
+        # Загрузка конфигурации
+        config = get_config()
+        qdrant_config = config.get("qdrant", {})
+        
+        # Инициализация векторного хранилища
+        vdb_url = request.vdb_url.strip().rstrip("/")
+        if not vdb_url.startswith("http"):
+            vdb_url = f"http://{vdb_url}"
+        
+        # Создаем временный менеджер для проверки подключения
+        vector_store_manager = QdrantVectorStoreManager(
+            url=vdb_url,
+            api_key=qdrant_config.get("api_key"),
+            collection_name="temp",  # Временное имя, не используется
+            vector_size=qdrant_config.get("vector_size", 1024),
+            timeout=5  # Короткий таймаут для быстрой проверки
+        )
+        
+        # Проверяем подключение
+        available, error_message = vector_store_manager.check_connection(timeout=5)
+        
+        if available:
+            # Пытаемся получить версию Qdrant
+            version = None
+            try:
+                import httpx
+                response = httpx.get(f"{vdb_url}/", timeout=5)
+                if response.status_code == 200:
+                    info = response.json()
+                    version = info.get("version")
+            except:
+                pass
+            
+            result = QdrantHealthCheckResponse(
+                available=True,
+                message="Qdrant сервер доступен",
+                version=version
+            )
+        else:
+            result = QdrantHealthCheckResponse(
+                available=False,
+                message=error_message or "Qdrant сервер недоступен"
+            )
+        
+        return JSONResponse(status_code=200, content=result.model_dump())
+        
+    except Exception as e:
+        logger.exception("Неожиданная ошибка при проверке доступности Qdrant")
+        return JSONResponse(
+            status_code=200,
+            content=QdrantHealthCheckResponse(
+                available=False,
+                message=f"Ошибка при проверке доступности: {str(e)}"
+            ).model_dump()
+        )
+
+
+@router.post(
     "/rag/collections",
     summary="Получение списка коллекций",
     description="Получение информации о всех коллекциях в векторной базе данных"
 )
 async def get_collections(
-    vdb_url: str,
+    request: CollectionListRequest,
 ) -> JSONResponse:
     """
     Получение списка коллекций в векторной БД.
     
     Args:
-        vdb_url: URL векторной базы данных (query parameter)
+        request: Запрос с параметром vdb_url (тело запроса)
         
     Returns:
         Список коллекций с информацией о каждой
     """
     try:
-        logger.info(f"Получен запрос на получение списка коллекций: vdb_url={vdb_url}")
-        
-        # Валидация параметра
-        if not vdb_url or not vdb_url.strip():
-            return JSONResponse(
-                status_code=200,
-                content=error_response_body(
-                    error="Ошибка валидации запроса",
-                    detail="Параметр 'vdb_url' обязателен для заполнения",
-                    code="missing_vdb_url",
-                ),
-            )
+        logger.info(f"Получен запрос на получение списка коллекций: vdb_url={request.vdb_url}")
         
         # Инициализация RAG сервиса
         rag_service = RAGService()
         
-        request = CollectionListRequest(vdb_url=vdb_url.strip())
         result = rag_service.get_collections(request)
         
         # Убираем поле success, если оно есть, так как успех определяется наличием content

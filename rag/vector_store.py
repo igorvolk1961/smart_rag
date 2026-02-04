@@ -3,7 +3,7 @@
 """
 
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -15,6 +15,7 @@ from qdrant_client.models import (
     MatchValue
 )
 from llama_index.vector_stores.qdrant import QdrantVectorStore
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -237,4 +238,28 @@ class QdrantVectorStoreManager:
         except Exception as e:
             logger.error(f"Ошибка при получении количества точек: {e}", exc_info=True)
             return 0
+    
+    def check_connection(self, timeout: int = 5) -> Tuple[bool, Optional[str]]:
+        """
+        Быстрая проверка доступности Qdrant сервера.
+        
+        Args:
+            timeout: Таймаут проверки в секундах (по умолчанию 5 секунд)
+            
+        Returns:
+            Кортеж (доступен, сообщение_об_ошибке)
+        """
+        try:
+            # Используем HTTP запрос для быстрой проверки
+            response = httpx.get(f"{self.url}/", timeout=timeout)
+            if response.status_code == 200:
+                return True, None
+            else:
+                return False, f"Qdrant вернул статус {response.status_code}"
+        except httpx.ConnectError:
+            return False, f"Не удалось подключиться к Qdrant на {self.url}. Убедитесь, что сервер запущен."
+        except httpx.TimeoutException:
+            return False, f"Таймаут подключения к Qdrant на {self.url}. Сервер не отвечает."
+        except Exception as e:
+            return False, f"Ошибка при проверке подключения к Qdrant: {str(e)}"
 

@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Union
 from urllib.parse import quote
 
 import httpx
+from loguru import logger
 
 from api.exceptions import ServiceError
 
@@ -62,7 +63,23 @@ class SiuClient:
             with httpx.Client(timeout=self._timeout) as client:
                 response = client.get(url, cookies=self._cookies)
                 response.raise_for_status()
-                return response.json()
+                
+                # Проверяем Content-Type перед парсингом JSON
+                content_type = response.headers.get("content-type", "").lower()
+                if "application/json" in content_type or "text/json" in content_type:
+                    return response.json()
+                else:
+                    # Если это не JSON, возвращаем текст как строку или пустой словарь
+                    # в зависимости от того, что ожидается
+                    response_text = response.text if response.text else ""
+                    # Пытаемся распарсить как JSON на всякий случай (на случай неправильного Content-Type)
+                    if response_text.strip().startswith(("{", "[")):
+                        try:
+                            return json.loads(response_text)
+                        except json.JSONDecodeError:
+                            pass
+                    # Если не JSON, возвращаем пустой словарь, чтобы не ломать код, ожидающий dict/list
+                    return {}
         except httpx.HTTPStatusError as e:
             raise ServiceError(
                 error=f"Ошибка сервиса СИУ ({error_label})",
@@ -76,13 +93,6 @@ class SiuClient:
                 detail=str(e),
                 status_code=503,
                 code="siu_connection_error",
-            ) from e
-        except json.JSONDecodeError as e:
-            raise ServiceError(
-                error=f"Ошибка ответа сервиса СИУ ({error_label})",
-                detail=f"Некорректный JSON в ответе: {e}",
-                status_code=502,
-                code="siu_invalid_response",
             ) from e
 
     def _post(
@@ -104,7 +114,23 @@ class SiuClient:
                     headers={"Content-Type": "application/json;charset=utf-8"},
                 )
                 response.raise_for_status()
-                return response.json()
+                
+                # Проверяем Content-Type перед парсингом JSON
+                content_type = response.headers.get("content-type", "").lower()
+                if "application/json" in content_type or "text/json" in content_type:
+                    return response.json()
+                else:
+                    # Если это не JSON, возвращаем текст как строку или пустой словарь
+                    # в зависимости от того, что ожидается
+                    response_text = response.text if response.text else ""
+                    # Пытаемся распарсить как JSON на всякий случай (на случай неправильного Content-Type)
+                    if response_text.strip().startswith(("{", "[")):
+                        try:
+                            return json.loads(response_text)
+                        except json.JSONDecodeError:
+                            pass
+                    # Если не JSON, возвращаем пустой словарь, чтобы не ломать код, ожидающий dict/list
+                    return {}
         except httpx.HTTPStatusError as e:
             raise ServiceError(
                 error=f"Ошибка сервиса СИУ ({error_label})",
@@ -118,13 +144,6 @@ class SiuClient:
                 detail=str(e),
                 status_code=503,
                 code="siu_connection_error",
-            ) from e
-        except json.JSONDecodeError as e:
-            raise ServiceError(
-                error=f"Ошибка ответа сервиса СИУ ({error_label})",
-                detail=f"Некорректный JSON в ответе: {e}",
-                status_code=502,
-                code="siu_invalid_response",
             ) from e
 
     def get_current_user_info(self) -> dict[str, Any]:
@@ -334,8 +353,56 @@ class SiuClient:
                 code="siu_invalid_response",
             ) from e
 
-    def get_irv_file_content(self, file: dict[str, Any]) -> Any:
-        """Чтение содержимого файла ИР (reportSiuGetIrvFileContent). file: dict с irvfId."""
+    def _get_binary(
+        self,
+        path: str,
+        *,
+        error_label: str = "запрос",
+        error_code: str = "siu_error",
+        return_text: bool = False,
+    ) -> Union[bytes, str]:
+        """
+        GET api_base + path для бинарных/текстовых данных.
+        
+        Args:
+            path: Путь к ресурсу
+            error_label: Метка для ошибки
+            error_code: Код ошибки
+            return_text: Если True, возвращает текст; если False, возвращает байты
+            
+        Returns:
+            bytes или str в зависимости от return_text
+        """
+        url = self._api_base + path
+        try:
+            with httpx.Client(timeout=self._timeout) as client:
+                response = client.get(url, cookies=self._cookies)
+                response.raise_for_status()
+                if return_text:
+                    return response.text
+                else:
+                    return response.content
+        except httpx.HTTPStatusError as e:
+            raise ServiceError(
+                error=f"Ошибка сервиса СИУ ({error_label})",
+                detail=f"Сервис вернул {e.response.status_code}: {e.response.text[:200] if e.response.text else ''}",
+                status_code=e.response.status_code,
+                code=error_code,
+            ) from e
+        except httpx.HTTPError as e:
+            raise ServiceError(
+                error=f"Ошибка соединения с сервисом СИУ ({error_label})",
+                detail=str(e),
+                status_code=503,
+                code="siu_connection_error",
+            ) from e
+
+    def get_irv_file_content(self, file: dict[str, Any]) -> Union[bytes, str]:
+        """
+        Чтение содержимого файла ИР (reportSiuGetIrvFileContent). 
+        file: dict с irvfId. 
+        Возвращает текст для текстовых файлов (включая markdown) или байты для бинарных.
+        """
         irvf_id = file.get("irvfId") if isinstance(file, dict) else None
         if not irvf_id:
             raise ServiceError(
@@ -344,10 +411,20 @@ class SiuClient:
                 status_code=400,
                 code="invalid_file_object",
             )
-        return self._get(
+        
+        # Определяем тип файла по расширению
+        file_name = file.get("name", "") if isinstance(file, dict) else ""
+        file_ext = file_name.lower().split(".")[-1] if "." in file_name else ""
+        
+        # Текстовые форматы (включая markdown)
+        text_extensions = {"txt", "md", "markdown", "json", "xml", "html", "htm", "csv", "log"}
+        return_text = file_ext in text_extensions
+        
+        return self._get_binary(
             f"/file/{irvf_id}/read",
             error_label="чтение содержимого файла ИР",
             error_code="irv_file_read_error",
+            return_text=return_text,
         )
 
     def get_irv_file_status(self, file: dict[str, Any]) -> Any:
