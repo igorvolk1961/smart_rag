@@ -97,6 +97,72 @@ class ValidationErrorItem(BaseModel):
     type: Optional[str] = Field(None, description="Тип ошибки Pydantic (например: value_error.missing)")
 
 
+class RAGRequest(BaseModel):
+    """Запрос для работы с RAG (добавление/удаление файлов из векторной БД)."""
+    
+    vdb_url: str = Field(..., description="URL векторной базы данных")
+    irv_id: str = Field(..., description="Идентификатор версии информационного объекта")
+    action: str = Field(..., description="Действие: 'add' - добавить файлы, 'remove' - удалить файлы")
+
+
+class RAGAddResponse(BaseModel):
+    """Ответ при добавлении файлов в RAG."""
+    
+    success: bool = Field(..., description="Успешность операции")
+    irv_id: str = Field(..., description="Идентификатор версии ИО")
+    files_processed: int = Field(..., description="Количество обработанных файлов")
+    chunks_saved: int = Field(..., description="Количество сохраненных чанков")
+    toc_chunks_saved: int = Field(0, description="Количество сохраненных чанков оглавления")
+    files_info: List[Dict[str, Any]] = Field(default_factory=list, description="Информация о каждом обработанном файле")
+
+
+class RAGRemoveResponse(BaseModel):
+    """Ответ при удалении файлов из RAG."""
+    
+    success: bool = Field(..., description="Успешность операции")
+    irv_id: str = Field(..., description="Идентификатор версии ИО")
+    chunks_deleted: int = Field(..., description="Количество удаленных чанков")
+
+
+class CollectionListRequest(BaseModel):
+    """Запрос для получения списка коллекций в векторной БД."""
+    
+    vdb_url: str = Field(..., description="URL векторной базы данных")
+
+
+class CollectionInfo(BaseModel):
+    """Информация об одной коллекции."""
+    
+    name: str = Field(..., description="Имя коллекции")
+    points_count: int = Field(..., description="Количество точек в коллекции")
+    status: Optional[str] = Field(None, description="Статус коллекции")
+    vector_size: Optional[int] = Field(None, description="Размер вектора")
+    distance: Optional[str] = Field(None, description="Метрика расстояния")
+
+
+class CollectionListResponse(BaseModel):
+    """Ответ со списком коллекций."""
+    
+    success: bool = Field(..., description="Успешность операции")
+    collections: List[CollectionInfo] = Field(default_factory=list, description="Список коллекций")
+    total: int = Field(..., description="Общее количество коллекций")
+
+
+class CollectionDeleteRequest(BaseModel):
+    """Запрос для удаления коллекции из векторной БД."""
+    
+    vdb_url: str = Field(..., description="URL векторной базы данных")
+    collection_name: str = Field(..., description="Имя коллекции для удаления")
+
+
+class CollectionDeleteResponse(BaseModel):
+    """Ответ при удалении коллекции."""
+    
+    success: bool = Field(..., description="Успешность операции")
+    collection_name: str = Field(..., description="Имя удаленной коллекции")
+    message: str = Field(..., description="Сообщение о результате операции")
+
+
 class ErrorResponse(BaseModel):
     """Модель для ошибок API."""
     

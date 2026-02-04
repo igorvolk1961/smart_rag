@@ -12,13 +12,20 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from api.chat_history import load_chat_history, save_chat_history
-from api.models.llm_models import AssistantRequest, error_response_body
+from api.models.llm_models import (
+    AssistantRequest, 
+    error_response_body, 
+    RAGRequest,
+    CollectionListRequest,
+    CollectionDeleteRequest,
+)
 from api.services.llm_service import get_llm_service, LLMService
+from api.services.rag_service import RAGService
 from api.siu_client import SiuClient
 from api.exceptions import ServiceError
 
 
-router = APIRouter(prefix="/api/v1/llm", tags=["LLM"])
+router = APIRouter(prefix="/v1", tags=["LLM"])
 
 
 def extract_callback_info(http_request: Request) -> dict[str, Any]:
@@ -123,7 +130,7 @@ async def generate_response(
         if "error" in response:
             return JSONResponse(
                 status_code=200,
-                content=response,
+                content=response,  # response уже содержит поле error
             )
 
         # Если ответ успешен, сохраняем историю чата
@@ -232,3 +239,226 @@ async def clear_cache(
     return {
         "message": "Кэш успешно очищен"
     }
+
+
+@router.post(
+    "/rag/manage",
+    summary="Управление файлами в RAG",
+    description=(
+        "Добавление или удаление файлов информационного объекта в векторную базу данных. "
+        "В режиме 'add' файлы docx и txt обрабатываются через SmartChanker и сохраняются в БД. "
+        "В режиме 'remove' удаляются все чанки, связанные с указанным irv_id."
+    ),
+)
+async def manage_rag_files(
+    request: RAGRequest,
+    http_request: Request,
+) -> JSONResponse:
+    """
+    Управление файлами в RAG-системе.
+    
+    Args:
+        request: Запрос с параметрами vdb_url, irv_id и action
+        http_request: HTTP запрос для извлечения контекста
+        
+    Returns:
+        Результат операции (добавление или удаление)
+    """
+    try:
+        logger.info(f"Получен запрос на управление RAG файлами: action={request.action}, irv_id={request.irv_id}")
+        
+        # Валидация action
+        if request.action not in ["add", "remove"]:
+            return JSONResponse(
+                status_code=200,
+                content=error_response_body(
+                    error="Ошибка валидации запроса",
+                    detail=f"Недопустимое значение action: '{request.action}'. Допустимые значения: 'add', 'remove'.",
+                    code="invalid_action",
+                ),
+            )
+        
+        # Извлечение контекста для работы с СИУ
+        base_referer_url, jsessionid = extract_callback_info(http_request)
+        siu_client = SiuClient(base_referer_url, jsessionid)
+        
+        # Инициализация RAG сервиса
+        rag_service = RAGService()
+        
+        if request.action == "add":
+            result = rag_service.add_files_to_rag(request, siu_client)
+            # Убираем поле success, если оно есть, так как успех определяется наличием content
+            if isinstance(result, dict) and "success" in result:
+                result = {k: v for k, v in result.items() if k != "success"}
+            return JSONResponse(status_code=200, content={"content": result})
+        else:  # remove
+            result = rag_service.remove_files_from_rag(request)
+            # Убираем поле success, если оно есть
+            if isinstance(result, dict) and "success" in result:
+                result = {k: v for k, v in result.items() if k != "success"}
+            return JSONResponse(status_code=200, content={"content": result})
+            
+    except ServiceError as e:
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error=e.error,
+                detail=e.detail,
+                code=e.code,
+            ),
+        )
+    except Exception as e:
+        logger.exception("Неожиданная ошибка при управлении RAG файлами")
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error="Внутренняя ошибка сервера",
+                detail=str(e),
+                code="internal_error",
+            ),
+        )
+
+
+@router.get(
+    "/rag/collections",
+    summary="Получение списка коллекций",
+    description="Получение информации о всех коллекциях в векторной базе данных"
+)
+async def get_collections(
+    vdb_url: str,
+) -> JSONResponse:
+    """
+    Получение списка коллекций в векторной БД.
+    
+    Args:
+        vdb_url: URL векторной базы данных (query parameter)
+        
+    Returns:
+        Список коллекций с информацией о каждой
+    """
+    try:
+        logger.info(f"Получен запрос на получение списка коллекций: vdb_url={vdb_url}")
+        
+        # Валидация параметра
+        if not vdb_url or not vdb_url.strip():
+            return JSONResponse(
+                status_code=200,
+                content=error_response_body(
+                    error="Ошибка валидации запроса",
+                    detail="Параметр 'vdb_url' обязателен для заполнения",
+                    code="missing_vdb_url",
+                ),
+            )
+        
+        # Инициализация RAG сервиса
+        rag_service = RAGService()
+        
+        request = CollectionListRequest(vdb_url=vdb_url.strip())
+        result = rag_service.get_collections(request)
+        
+        # Убираем поле success, если оно есть, так как успех определяется наличием content
+        if isinstance(result, dict) and "success" in result:
+            result = {k: v for k, v in result.items() if k != "success"}
+        
+        return JSONResponse(status_code=200, content={"content": result})
+        
+    except ServiceError as e:
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error=e.error,
+                detail=e.detail,
+                code=e.code,
+            ),
+        )
+    except Exception as e:
+        logger.exception("Неожиданная ошибка при получении списка коллекций")
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error="Внутренняя ошибка сервера",
+                detail=str(e),
+                code="internal_error",
+            ),
+        )
+
+
+@router.delete(
+    "/rag/collections/{collection_name}",
+    summary="Удаление коллекции",
+    description="Удаление указанной коллекции из векторной базы данных"
+)
+async def delete_collection(
+    collection_name: str,
+    vdb_url: str,
+) -> JSONResponse:
+    """
+    Удаление коллекции из векторной БД.
+    
+    Args:
+        collection_name: Имя коллекции для удаления (path parameter)
+        vdb_url: URL векторной базы данных (query parameter)
+        
+    Returns:
+        Результат удаления коллекции
+    """
+    try:
+        logger.info(f"Получен запрос на удаление коллекции: collection_name={collection_name}, vdb_url={vdb_url}")
+        
+        # Валидация параметров
+        if not collection_name or not collection_name.strip():
+            return JSONResponse(
+                status_code=200,
+                content=error_response_body(
+                    error="Ошибка валидации запроса",
+                    detail="Параметр 'collection_name' обязателен для заполнения",
+                    code="missing_collection_name",
+                ),
+            )
+        
+        if not vdb_url or not vdb_url.strip():
+            return JSONResponse(
+                status_code=200,
+                content=error_response_body(
+                    error="Ошибка валидации запроса",
+                    detail="Параметр 'vdb_url' обязателен для заполнения",
+                    code="missing_vdb_url",
+                ),
+            )
+        
+        # Инициализация RAG сервиса
+        rag_service = RAGService()
+        
+        request = CollectionDeleteRequest(
+            vdb_url=vdb_url.strip(),
+            collection_name=collection_name.strip()
+        )
+        result = rag_service.delete_collection(request)
+        
+        # Убираем поле success, если оно есть, так как успех определяется наличием content
+        if isinstance(result, dict) and "success" in result:
+            result = {k: v for k, v in result.items() if k != "success"}
+        
+        return JSONResponse(status_code=200, content={"content": result})
+        
+    except ServiceError as e:
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error=e.error,
+                detail=e.detail,
+                code=e.code,
+            ),
+        )
+    except Exception as e:
+        logger.exception("Неожиданная ошибка при удалении коллекции")
+        return JSONResponse(
+            status_code=200,
+            content=error_response_body(
+                error="Внутренняя ошибка сервера",
+                detail=str(e),
+                code="internal_error",
+            ),
+        )
+
+
