@@ -359,7 +359,7 @@ class OllamaEmbedding(BaseEmbedding):
         }
         
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, verify=False) as client:
                 response = client.post(endpoint, json=payload)
                 response.raise_for_status()
                 

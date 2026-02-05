@@ -109,6 +109,7 @@ class ChunkerIntegration:
                 "chunks": chunks_data["chunks"],
                 "metadata": chunks_data["metadata"],
                 "toc_chunks": chunks_data.get("toc_chunks", []),
+                "table_chunks": chunks_data.get("table_chunks", []),
                 "output_dir": str(doc_output_dir)
             }
             
@@ -167,7 +168,8 @@ class ChunkerIntegration:
         return {
             "chunks": chunks,
             "metadata": metadata,
-            "toc_chunks": toc_chunks
+            "toc_chunks": toc_chunks,
+            "table_chunks": result_dict.get("table_chunks", []) if isinstance(result_dict, dict) else []
         }
     
     def _load_chunks_from_result(
@@ -191,6 +193,7 @@ class ChunkerIntegration:
             "total_chunks": 0
         }
         toc_chunks = []
+        table_chunks = []
         
         # Поиск JSON файла с результатами
         json_files = list(output_dir.glob("*.json"))
@@ -268,10 +271,18 @@ class ChunkerIntegration:
                         if toc_chunk:
                             toc_chunks.append(toc_chunk)
                 
+                # Извлечение table_chunks из результата (если есть)
+                if "table_chunks" in result_data:
+                    for idx, table_chunk_data in enumerate(result_data["table_chunks"]):
+                        table_chunk = self._process_chunk(table_chunk_data, idx, document_id, is_table=True)
+                        if table_chunk:
+                            table_chunks.append(table_chunk)
+                
                 # Извлечение метаданных
                 metadata.update({
                     "total_chunks": len(chunks),
                     "has_toc": len(toc_chunks) > 0,
+                    "has_tables": len(table_chunks) > 0,
                     "source_file": str(main_json_file)
                 })
                 
@@ -290,7 +301,8 @@ class ChunkerIntegration:
         return {
             "chunks": chunks,
             "metadata": metadata,
-            "toc_chunks": toc_chunks
+            "toc_chunks": toc_chunks,
+            "table_chunks": table_chunks if 'table_chunks' in locals() else []
         }
     
     def _process_chunk(
@@ -298,7 +310,8 @@ class ChunkerIntegration:
         chunk_data: Any, 
         index: int, 
         document_id: str,
-        is_toc: bool = False
+        is_toc: bool = False,
+        is_table: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Обработка одного чанка и извлечение метаданных.
@@ -325,12 +338,13 @@ class ChunkerIntegration:
                     "document_id": document_id,
                     "chunk_index": index,
                     "is_toc": is_toc,
+                    "is_table": is_table,
                     "hierarchy_level": chunk_data.get("level", chunk_data.get("hierarchy_level")),
                     "section_number": chunk_data.get("section_number", chunk_data.get("number")),
                     "parent_section": chunk_data.get("parent_section"),
                     "sibling_index": chunk_data.get("sibling_index"),
                     "position": chunk_data.get("position"),
-                    "chunk_type": chunk_data.get("type", "text")
+                    "chunk_type": chunk_data.get("type", "table" if is_table else ("toc" if is_toc else "text"))
                 }
                 
                 # Удаление None значений
@@ -348,7 +362,9 @@ class ChunkerIntegration:
                     "metadata": {
                         "document_id": document_id,
                         "chunk_index": index,
-                        "is_toc": is_toc
+                        "is_toc": is_toc,
+                        "is_table": is_table,
+                        "chunk_type": "table" if is_table else ("toc" if is_toc else "text")
                     }
                 }
             

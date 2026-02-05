@@ -172,12 +172,22 @@ class LLMService:
             # Создаем агента
             agent = await AgentFactory.create(agent_def, task_messages)
             
-            # Передаем file_irv_ids и другие параметры в custom_context агента для использования в RAGTool
-            if request.file_irv_ids or request.vdb_url:
-                agent._context.custom_context = {
-                    "file_irv_ids": request.file_irv_ids,
-                    "vdb_url": request.vdb_url,
-                }
+            # Передаем параметры в custom_context агента для использования в RAGTool
+            custom_context = {}
+            if request.file_irv_ids:
+                custom_context["file_irv_ids"] = request.file_irv_ids
+            if request.vdb_url:
+                custom_context["vdb_url"] = request.vdb_url
+            # Параметры эмбеддингов для RAG поиска
+            if request.embed_api_key:
+                custom_context["embed_api_key"] = request.embed_api_key
+            if request.embed_url:
+                custom_context["embed_url"] = request.embed_url
+            if request.embed_model_name:
+                custom_context["embed_model_name"] = request.embed_model_name
+            
+            if custom_context:
+                agent._context.custom_context = custom_context
             
             # Запускаем агента и ждем завершения выполнения
             # Streaming используется только внутри агента для передачи данных между reasoning и action фазами

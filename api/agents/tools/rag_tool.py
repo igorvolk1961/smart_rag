@@ -48,23 +48,48 @@ class RAGTool(BaseTool):
         
         logger.info(f"🔍 RAG search query: '{self.query}' (max_results={self.max_results})")
         
-        # Получаем file_irv_ids из custom_context или из параметра tool
+        # Получаем параметры из custom_context или из параметров tool
         file_irv_ids = self.file_irv_ids
-        if not file_irv_ids and context.custom_context:
-            if isinstance(context.custom_context, dict):
-                file_irv_ids = context.custom_context.get("file_irv_ids")
+        vdb_url = None
+        embed_api_key = None
+        embed_url = None
+        embed_model_name = None
+        
+        if context.custom_context and isinstance(context.custom_context, dict):
+            file_irv_ids = file_irv_ids or context.custom_context.get("file_irv_ids")
+            vdb_url = context.custom_context.get("vdb_url")
+            embed_api_key = context.custom_context.get("embed_api_key")
+            embed_url = context.custom_context.get("embed_url")
+            embed_model_name = context.custom_context.get("embed_model_name")
         
         # TODO: Реализовать RAG поиск используя существующий RAG pipeline
         # Для этого нужно будет:
         # 1. Интегрировать с rag/retriever.py
         # 2. Использовать file_irv_ids для фильтрации по документам
-        # 3. Вернуть релевантные чанки с метаданными
+        # 3. Использовать embed_api_key, embed_url, embed_model_name для создания эмбеддингов
+        # 4. Использовать vdb_url для подключения к векторной БД
+        # 5. Вернуть релевантные чанки с метаданными
+        
+        # Формируем информацию о доступных параметрах
+        params_info = []
+        if file_irv_ids:
+            params_info.append(f"File IRV IDs: {file_irv_ids}")
+        if vdb_url:
+            params_info.append(f"VDB URL: {vdb_url}")
+        if embed_api_key:
+            params_info.append(f"Embed API Key: {'*' * min(len(embed_api_key), 10)}...")
+        if embed_url:
+            params_info.append(f"Embed URL: {embed_url}")
+        if embed_model_name:
+            params_info.append(f"Embed Model: {embed_model_name}")
+        
+        params_str = "\n".join(params_info) if params_info else "No additional parameters"
         
         return f"""RAG Tool (placeholder)
         
 Query: {self.query}
 Max Results: {self.max_results}
-File IRV IDs: {file_irv_ids or 'All documents'}
+{params_str}
 
 Note: RAG functionality is not yet implemented. This is a placeholder.
 The actual implementation will use the existing RAG pipeline to search through indexed documents."""

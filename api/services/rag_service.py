@@ -28,6 +28,56 @@ from api.siu_client import SiuClient
 
 
 class RAGService:
+    """Сервис для работы с RAG."""
+    
+    @staticmethod
+    def _handle_qdrant_connection_error(e: Exception, vdb_url: str) -> ServiceError:
+        """
+        Обработка ошибок подключения к Qdrant с понятным сообщением.
+        
+        Args:
+            e: Исключение, возникшее при работе с Qdrant
+            vdb_url: URL Qdrant сервера
+            
+        Returns:
+            ServiceError с понятным сообщением
+        """
+        error_message = str(e)
+        error_type = type(e).__name__
+        
+        # Проверяем различные типы ошибок подключения
+        # Windows ошибка 10061: "Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение"
+        is_windows_connection_error = (
+            isinstance(e, OSError) and hasattr(e, 'winerror') and e.winerror == 10061
+        ) or "10061" in error_message
+        
+        if "timeout" in error_message.lower() or "Timeout" in error_type or isinstance(e, TimeoutError):
+            logger.error(f"Таймаут подключения к Qdrant на {vdb_url}: {e}")
+            return ServiceError(
+                error="Qdrant недоступен",
+                detail=f"Таймаут подключения к Qdrant серверу на {vdb_url}. Убедитесь, что сервер запущен и доступен.",
+                code="qdrant_timeout"
+            )
+        elif (
+            "connection" in error_message.lower() or 
+            "Connection" in error_type or 
+            "connect" in error_message.lower() or
+            is_windows_connection_error or
+            isinstance(e, (ConnectionError, ConnectionRefusedError))
+        ):
+            logger.error(f"Ошибка подключения к Qdrant на {vdb_url}: {e}")
+            return ServiceError(
+                error="Qdrant недоступен",
+                detail=f"Не удалось подключиться к Qdrant серверу на {vdb_url}. Убедитесь, что сервер запущен и доступен.",
+                code="qdrant_connection_error"
+            )
+        else:
+            logger.exception(f"Ошибка при работе с Qdrant на {vdb_url}: {e}")
+            return ServiceError(
+                error="Ошибка при работе с Qdrant",
+                detail=f"Ошибка при работе с Qdrant сервером на {vdb_url}: {error_message}",
+                code="qdrant_error"
+            )
     """Сервис для управления файлами в RAG-системе."""
     
     # Кэш для переиспользуемых компонентов
@@ -68,6 +118,7 @@ class RAGService:
                     files_processed=0,
                     chunks_saved=0,
                     toc_chunks_saved=0,
+                    table_chunks_saved=0,
                     files_info=[]
                 ).model_dump()
             
@@ -78,15 +129,45 @@ class RAGService:
             
             try:
                 # Инициализация компонентов RAG
-                chunker, embedding, vector_store_manager = self._initialize_rag_components(
-                    request, 
-                    chunker_output_dir=str(Path(chunker_temp_dir) / "chunks")
-                )
+                try:
+                    chunker, embedding, vector_store_manager = self._initialize_rag_components(
+                        request, 
+                        chunker_output_dir=str(Path(chunker_temp_dir) / "chunks")
+                    )
+                except Exception as init_error:
+                    # Обрабатываем ошибки подключения к Qdrant при инициализации
+                    vdb_url = request.vdb_url.strip().rstrip("/")
+                    if not vdb_url.startswith("http"):
+                        vdb_url = f"http://{vdb_url}"
+                    raise self._handle_qdrant_connection_error(init_error, vdb_url)
+                
+                # Удаляем все старые чанки с этим irv_id перед добавлением новых
+                # Это предотвращает создание дубликатов при повторном сохранении документа
+                vdb_url = request.vdb_url.strip().rstrip("/")
+                if not vdb_url.startswith("http"):
+                    vdb_url = f"http://{vdb_url}"
+                try:
+                    deleted_count = self._delete_chunks_by_irv_id(
+                        vector_store_manager,
+                        request.irv_id,
+                        vdb_url
+                    )
+                    if deleted_count > 0:
+                        logger.info(f"Перед добавлением новых чанков удалено {deleted_count} старых чанков для irv_id={request.irv_id}")
+                except ServiceError:
+                    # Пробрасываем ServiceError (ошибки подключения к Qdrant)
+                    raise
+                except Exception as e:
+                    # Обрабатываем неожиданные ошибки при удалении
+                    logger.warning(f"Ошибка при удалении старых чанков для irv_id={request.irv_id}: {e}. Продолжаем добавление новых чанков.")
+                    # Не прерываем выполнение - продолжаем добавление новых чанков
                 
                 # Обработка файлов
                 total_chunks = 0
                 total_toc_chunks = 0
+                total_table_chunks = 0
                 files_info = []
+                errors = []
                 
                 for file_data in files_to_process:
                     file_result = self._process_file(
@@ -100,9 +181,27 @@ class RAGService:
                         temp_path
                     )
                     if file_result:
-                        total_chunks += file_result["chunks_count"]
-                        total_toc_chunks += file_result["toc_chunks_count"]
+                        # Проверяем статус обработки файла
+                        if file_result.get("status") == "error":
+                            error_msg = file_result.get("error", "Неизвестная ошибка")
+                            file_name = file_result.get("file_name", "неизвестный файл")
+                            errors.append(f"{file_name}: {error_msg}")
+                            logger.error(f"Ошибка при обработке файла {file_name}: {error_msg}")
+                        else:
+                            # Учитываем чанки только для успешно обработанных файлов
+                            total_chunks += file_result.get("chunks_count", 0)
+                            total_toc_chunks += file_result.get("toc_chunks_count", 0)
+                            total_table_chunks += file_result.get("table_chunks_count", 0)
                         files_info.append(file_result)
+                
+                # Если были ошибки, выбрасываем исключение с деталями
+                if errors:
+                    error_details = "; ".join(errors)
+                    raise ServiceError(
+                        error="Ошибка при обработке файлов",
+                        detail=f"При обработке файлов возникли ошибки: {error_details}",
+                        code="rag_processing_error"
+                    )
                 
                 return RAGAddResponse(
                     success=True,
@@ -110,6 +209,7 @@ class RAGService:
                     files_processed=len(files_to_process),
                     chunks_saved=total_chunks,
                     toc_chunks_saved=total_toc_chunks,
+                    table_chunks_saved=total_table_chunks,
                     files_info=files_info
                 ).model_dump()
                 
@@ -120,9 +220,15 @@ class RAGService:
                 if Path(chunker_temp_dir).exists():
                     shutil.rmtree(chunker_temp_dir, ignore_errors=True)
                     
-        except Exception as e:
-            logger.exception(f"Ошибка при добавлении файлов в RAG: {e}")
+        except ServiceError:
+            # Пробрасываем ServiceError как есть (уже обработанные ошибки)
             raise
+        except Exception as e:
+            # Обрабатываем необработанные ошибки подключения к Qdrant
+            vdb_url = request.vdb_url.strip().rstrip("/")
+            if not vdb_url.startswith("http"):
+                vdb_url = f"http://{vdb_url}"
+            raise self._handle_qdrant_connection_error(e, vdb_url)
 
     def remove_files_from_rag(self, request: RAGRequest) -> Dict[str, Any]:
         """
@@ -147,13 +253,17 @@ class RAGService:
             if not vdb_url.startswith("http"):
                 vdb_url = f"http://{vdb_url}"
             
-            vector_store_manager = QdrantVectorStoreManager(
-                url=vdb_url,
-                api_key=qdrant_config.get("api_key"),
-                collection_name=qdrant_config.get("collection_name", "smart_rag_documents"),
-                vector_size=qdrant_config.get("vector_size", 1024),
-                timeout=qdrant_config.get("timeout", 30)
-            )
+            try:
+                vector_store_manager = QdrantVectorStoreManager(
+                    url=vdb_url,
+                    api_key=qdrant_config.get("api_key"),
+                    collection_name=qdrant_config.get("collection_name", "smart_rag_documents"),
+                    vector_size=qdrant_config.get("vector_size", 1024),
+                    timeout=qdrant_config.get("timeout", 30)
+                )
+            except Exception as init_error:
+                # Обрабатываем ошибки подключения к Qdrant при инициализации
+                raise self._handle_qdrant_connection_error(init_error, vdb_url)
             
             # Создание фильтра для поиска точек с указанным irv_id
             filter_condition = Filter(
@@ -166,13 +276,17 @@ class RAGService:
             )
             
             # Получаем список точек для удаления через scroll
-            scroll_result = vector_store_manager.client.scroll(
-                collection_name=vector_store_manager.collection_name,
-                scroll_filter=filter_condition,
-                limit=10000,  # Максимальное количество точек для удаления за раз
-                with_payload=False,
-                with_vectors=False
-            )
+            try:
+                scroll_result = vector_store_manager.client.scroll(
+                    collection_name=vector_store_manager.collection_name,
+                    scroll_filter=filter_condition,
+                    limit=10000,  # Максимальное количество точек для удаления за раз
+                    with_payload=False,
+                    with_vectors=False
+                )
+            except Exception as scroll_error:
+                # Обрабатываем ошибки подключения к Qdrant при выполнении операций
+                raise self._handle_qdrant_connection_error(scroll_error, vdb_url)
             
             points_to_delete = [point.id for point in scroll_result[0]]
             
@@ -188,11 +302,15 @@ class RAGService:
             deleted_count = 0
             for i in range(0, len(points_to_delete), batch_size):
                 batch = points_to_delete[i:i + batch_size]
-                vector_store_manager.client.delete(
-                    collection_name=vector_store_manager.collection_name,
-                    points_selector=PointIdsList(points=batch)
-                )
-                deleted_count += len(batch)
+                try:
+                    vector_store_manager.client.delete(
+                        collection_name=vector_store_manager.collection_name,
+                        points_selector=PointIdsList(points=batch)
+                    )
+                    deleted_count += len(batch)
+                except Exception as delete_error:
+                    # Обрабатываем ошибки подключения к Qdrant при удалении
+                    raise self._handle_qdrant_connection_error(delete_error, vdb_url)
             
             logger.info(f"Удалено {deleted_count} чанков для irv_id={request.irv_id}")
             
@@ -202,9 +320,90 @@ class RAGService:
                 chunks_deleted=deleted_count
             ).model_dump()
             
-        except Exception as e:
-            logger.exception(f"Ошибка при удалении файлов из RAG: {e}")
+        except ServiceError:
+            # Пробрасываем ServiceError как есть (уже обработанные ошибки)
             raise
+        except Exception as e:
+            # Обрабатываем необработанные ошибки подключения к Qdrant
+            vdb_url = request.vdb_url.strip().rstrip("/")
+            if not vdb_url.startswith("http"):
+                vdb_url = f"http://{vdb_url}"
+            raise self._handle_qdrant_connection_error(e, vdb_url)
+
+    def _delete_chunks_by_irv_id(
+        self, 
+        vector_store_manager, 
+        irv_id: str,
+        vdb_url: str
+    ) -> int:
+        """
+        Удаление всех чанков с указанным irv_id из векторной БД.
+        
+        Args:
+            vector_store_manager: Менеджер векторного хранилища Qdrant
+            irv_id: Идентификатор версии информационного объекта
+            vdb_url: URL векторной БД (для обработки ошибок)
+            
+        Returns:
+            Количество удаленных чанков
+            
+        Raises:
+            ServiceError: При ошибках подключения к Qdrant
+        """
+        try:
+            # Создание фильтра для поиска точек с указанным irv_id
+            filter_condition = Filter(
+                must=[
+                    FieldCondition(
+                        key="irv_id",
+                        match=MatchValue(value=irv_id)
+                    )
+                ]
+            )
+            
+            # Получаем список точек для удаления через scroll
+            try:
+                scroll_result = vector_store_manager.client.scroll(
+                    collection_name=vector_store_manager.collection_name,
+                    scroll_filter=filter_condition,
+                    limit=10000,  # Максимальное количество точек для удаления за раз
+                    with_payload=False,
+                    with_vectors=False
+                )
+            except Exception as scroll_error:
+                # Обрабатываем ошибки подключения к Qdrant при выполнении операций
+                raise self._handle_qdrant_connection_error(scroll_error, vdb_url)
+            
+            points_to_delete = [point.id for point in scroll_result[0]]
+            
+            if not points_to_delete:
+                logger.debug(f"Не найдено чанков для удаления с irv_id={irv_id}")
+                return 0
+            
+            # Удаление точек батчами
+            batch_size = 1000
+            deleted_count = 0
+            for i in range(0, len(points_to_delete), batch_size):
+                batch = points_to_delete[i:i + batch_size]
+                try:
+                    vector_store_manager.client.delete(
+                        collection_name=vector_store_manager.collection_name,
+                        points_selector=PointIdsList(points=batch)
+                    )
+                    deleted_count += len(batch)
+                except Exception as delete_error:
+                    # Обрабатываем ошибки подключения к Qdrant при удалении
+                    raise self._handle_qdrant_connection_error(delete_error, vdb_url)
+            
+            logger.info(f"Удалено {deleted_count} старых чанков для irv_id={irv_id}")
+            return deleted_count
+            
+        except ServiceError:
+            # Пробрасываем ServiceError как есть (уже обработанные ошибки)
+            raise
+        except Exception as e:
+            # Обрабатываем необработанные ошибки подключения к Qdrant
+            raise self._handle_qdrant_connection_error(e, vdb_url)
 
     def _filter_attr_map_metadata(self, attr_map: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -353,11 +552,28 @@ class RAGService:
         embeddings_config = config.get("embeddings", {}).get("giga", {})
         
         # Определяем параметры: приоритет у параметров из запроса, затем конфигурация, затем переменные окружения
-        final_api_key = embed_api_key or os.getenv("GIGACHAT_AUTH_KEY")
+        # Проверяем, что ключ не пустой (если передан)
+        if embed_api_key is not None and not embed_api_key.strip():
+            raise ServiceError(
+                error="Неверный API ключ для эмбеддингов",
+                detail="API ключ указан в запросе, но является пустой строкой",
+                code="empty_embed_api_key",
+            )
+        
+        final_api_key = embed_api_key if embed_api_key and embed_api_key.strip() else os.getenv("GIGACHAT_AUTH_KEY")
+        
+        # Логируем источник ключа для отладки
+        if embed_api_key and embed_api_key.strip():
+            logger.debug("Используется API ключ из запроса (embed_api_key)")
+        elif os.getenv("GIGACHAT_AUTH_KEY"):
+            logger.debug("Используется API ключ из переменной окружения GIGACHAT_AUTH_KEY")
+        else:
+            logger.error("API ключ не найден ни в запросе, ни в переменных окружения")
+        
         if not final_api_key:
             raise ServiceError(
                 error="Не настроен API ключ для эмбеддингов",
-                detail="API ключ не указан в запросе и переменная окружения GIGACHAT_AUTH_KEY не установлена",
+                detail="API ключ не указан в запросе (embed_api_key) и переменная окружения GIGACHAT_AUTH_KEY не установлена",
                 code="missing_embed_api_key",
             )
         
@@ -374,7 +590,7 @@ class RAGService:
         
         if cache_key not in RAGService._embedding_cache:
             embedding = GigaEmbedding(
-                auth_key=final_api_key,
+                credentials=final_api_key,
                 scope=final_scope,
                 api_url=final_api_url,
                 model=final_model,
@@ -484,7 +700,8 @@ class RAGService:
                     "status": "error",
                     "error": "Не удалось извлечь содержимое файла",
                     "chunks_count": 0,
-                    "toc_chunks_count": 0
+                    "toc_chunks_count": 0,
+                    "table_chunks_count": 0
                 }
             
             # Сохранение файла во временную директорию
@@ -507,7 +724,7 @@ class RAGService:
             }
             
             # Создание узлов из чанков
-            nodes, toc_nodes = self._create_nodes_from_chunks(
+            nodes, toc_nodes, table_nodes = self._create_nodes_from_chunks(
                 chunker_result,
                 doc_metadata,
                 irv_id,
@@ -515,10 +732,20 @@ class RAGService:
             )
             
             # Индексация узлов
-            if nodes or toc_nodes:
-                all_nodes = nodes + toc_nodes
+            if nodes or toc_nodes or table_nodes:
+                all_nodes = nodes + toc_nodes + table_nodes
                 texts = [node.text for node in all_nodes]
-                embeddings_list = embedding._get_text_embeddings(texts)
+                try:
+                    embeddings_list = embedding._get_text_embeddings(texts)
+                except (RuntimeError, ValueError) as e:
+                    # Ошибка получения токена доступа или неверный формат ответа GigaChat
+                    error_msg = str(e)
+                    logger.error(f"Ошибка при получении эмбеддингов для файла {file_name}: {error_msg}")
+                    raise ServiceError(
+                        error="Ошибка получения эмбеддингов",
+                        detail=f"Не удалось получить эмбеддинги для файла {file_name}: {error_msg}",
+                        code="embedding_error"
+                    )
                 
                 if len(embeddings_list) == len(all_nodes):
                     # Сохранение в Qdrant
@@ -544,6 +771,7 @@ class RAGService:
                         "irvf_id": irvf_id,
                         "chunks_count": len(nodes),
                         "toc_chunks_count": len(toc_nodes),
+                        "table_chunks_count": len(table_nodes),
                         "status": "success"
                     }
                 else:
@@ -554,7 +782,8 @@ class RAGService:
                         "status": "error",
                         "error": "Несоответствие количества эмбеддингов",
                         "chunks_count": 0,
-                        "toc_chunks_count": 0
+                        "toc_chunks_count": 0,
+                        "table_chunks_count": 0
                     }
             else:
                 logger.warning(f"Не найдено чанков для файла {file_name}")
@@ -563,6 +792,7 @@ class RAGService:
                     "irvf_id": irvf_id,
                     "chunks_count": 0,
                     "toc_chunks_count": 0,
+                    "table_chunks_count": 0,
                     "status": "no_chunks"
                 }
             
@@ -574,7 +804,8 @@ class RAGService:
                 "status": "error",
                 "error": str(e),
                 "chunks_count": 0,
-                "toc_chunks_count": 0
+                "toc_chunks_count": 0,
+                "table_chunks_count": 0
             }
         finally:
             # Удаление временного файла
@@ -626,6 +857,7 @@ class RAGService:
         
         nodes = []
         toc_nodes = []
+        table_nodes = []
         
         # Обработка обычных чанков
         for idx, chunk_data in enumerate(chunker_result.get("chunks", [])):
@@ -669,7 +901,28 @@ class RAGService:
             )
             toc_nodes.append(node)
         
-        return nodes, toc_nodes
+        # Обработка чанков таблиц
+        for idx, table_chunk_data in enumerate(chunker_result.get("table_chunks", [])):
+            text = table_chunk_data.get("text", "")
+            if not text or not text.strip():
+                continue
+            
+            chunk_metadata = table_chunk_data.get("metadata", {})
+            node_metadata = {
+                **doc_metadata,
+                **chunk_metadata,
+                "chunk_index": idx,
+                "chunk_type": "table"
+            }
+            
+            node = TextNode(
+                text=text.strip(),
+                metadata=node_metadata,
+                id_=f"{irv_id}_{irvf_id}_table_{idx}"
+            )
+            table_nodes.append(node)
+        
+        return nodes, toc_nodes, table_nodes
 
     def get_collections(self, request: CollectionListRequest) -> Dict[str, Any]:
         """

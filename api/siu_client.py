@@ -60,7 +60,7 @@ class SiuClient:
         """GET api_base + path, возвращает response.json() (dict или list). При ошибке — ServiceError."""
         url = self._api_base + path
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout, verify=False) as client:
                 response = client.get(url, cookies=self._cookies)
                 response.raise_for_status()
                 
@@ -106,7 +106,7 @@ class SiuClient:
         """POST api_base + path с телом json_body. Возвращает response.json(). При ошибке — ServiceError."""
         url = self._api_base + path
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout, verify=False) as client:
                 response = client.post(
                     url,
                     cookies=self._cookies,
@@ -322,7 +322,7 @@ class SiuClient:
         path = f"/file/{irvf_id}/write?fileName={quote(file_name, safe='')}&crc={crc}"
         url = self._api_base + path
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout, verify=False) as client:
                 response = client.post(
                     url,
                     cookies=self._cookies,
@@ -375,7 +375,7 @@ class SiuClient:
         """
         url = self._api_base + path
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout, verify=False) as client:
                 response = client.get(url, cookies=self._cookies)
                 response.raise_for_status()
                 if return_text:

@@ -118,6 +118,7 @@ class RAGAddResponse(BaseModel):
     files_processed: int = Field(..., description="Количество обработанных файлов")
     chunks_saved: int = Field(..., description="Количество сохраненных чанков")
     toc_chunks_saved: int = Field(0, description="Количество сохраненных чанков оглавления")
+    table_chunks_saved: int = Field(0, description="Количество сохраненных чанков таблиц")
     files_info: List[Dict[str, Any]] = Field(default_factory=list, description="Информация о каждом обработанном файле")
 
 
