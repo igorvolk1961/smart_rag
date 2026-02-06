@@ -17,6 +17,7 @@ from api.exceptions import ServiceError
 from api.models.llm_models import (
     RAGAddResponse,
     RAGRemoveResponse,
+    RAGInfoResponse,
     RAGRequest,
     CollectionListRequest,
     CollectionListResponse,
@@ -178,7 +179,8 @@ class RAGService:
                         chunker,
                         embedding,
                         vector_store_manager,
-                        temp_path
+                        temp_path,
+                        max_chunk_size=getattr(request, 'max_chunk_size', None)
                     )
                     if file_result:
                         # Проверяем статус обработки файла
@@ -318,6 +320,145 @@ class RAGService:
                 success=True,
                 irv_id=request.irv_id,
                 chunks_deleted=deleted_count
+            ).model_dump()
+            
+        except ServiceError:
+            # Пробрасываем ServiceError как есть (уже обработанные ошибки)
+            raise
+        except Exception as e:
+            # Обрабатываем необработанные ошибки подключения к Qdrant
+            vdb_url = request.vdb_url.strip().rstrip("/")
+            if not vdb_url.startswith("http"):
+                vdb_url = f"http://{vdb_url}"
+            raise self._handle_qdrant_connection_error(e, vdb_url)
+
+    def get_file_info(self, request: RAGRequest) -> Dict[str, Any]:
+        """
+        Получение информации о файле в векторной БД.
+        
+        Args:
+            request: Запрос с параметрами irv_id и vdb_url
+            
+        Returns:
+            Словарь с информацией о файле
+        """
+        try:
+            from rag.vector_store import QdrantVectorStoreManager
+            from utils.config import get_config
+            
+            # Загрузка конфигурации
+            config = get_config()
+            qdrant_config = config.get("qdrant", {})
+            
+            # Инициализация векторного хранилища
+            vdb_url = request.vdb_url.strip().rstrip("/")
+            if not vdb_url.startswith("http"):
+                vdb_url = f"http://{vdb_url}"
+            
+            try:
+                vector_store_manager = QdrantVectorStoreManager(
+                    url=vdb_url,
+                    api_key=qdrant_config.get("api_key"),
+                    collection_name=qdrant_config.get("collection_name", "smart_rag_documents"),
+                    vector_size=qdrant_config.get("vector_size", 1024),
+                    timeout=qdrant_config.get("timeout", 30)
+                )
+            except Exception as init_error:
+                # Обрабатываем ошибки подключения к Qdrant при инициализации
+                raise self._handle_qdrant_connection_error(init_error, vdb_url)
+            
+            # Создание фильтра для поиска точек с указанным irv_id
+            filter_condition = Filter(
+                must=[
+                    FieldCondition(
+                        key="irv_id",
+                        match=MatchValue(value=request.irv_id)
+                    )
+                ]
+            )
+            
+            # Получаем все точки с payload для анализа
+            try:
+                scroll_result = vector_store_manager.client.scroll(
+                    collection_name=vector_store_manager.collection_name,
+                    scroll_filter=filter_condition,
+                    limit=10000,  # Максимальное количество точек для анализа
+                    with_payload=True,
+                    with_vectors=False
+                )
+            except Exception as scroll_error:
+                # Обрабатываем ошибки подключения к Qdrant при выполнении операций
+                raise self._handle_qdrant_connection_error(scroll_error, vdb_url)
+            
+            points = scroll_result[0]
+            
+            if not points:
+                # Файл не найден в векторной БД
+                return RAGInfoResponse(
+                    success=True,
+                    irv_id=request.irv_id,
+                    total_chunks=0,
+                    text_chunks=0,
+                    toc_chunks=0,
+                    table_chunks=0,
+                    files_info=[]
+                ).model_dump()
+            
+            # Анализируем точки для подсчета статистики
+            text_chunks = 0
+            toc_chunks = 0
+            table_chunks = 0
+            files_dict = {}  # Словарь для группировки по файлам
+            
+            for point in points:
+                payload = point.payload if hasattr(point, 'payload') else {}
+                
+                # Определяем тип чанка
+                chunk_type = payload.get("chunk_type", "text")
+                is_toc = payload.get("is_toc", False)
+                is_table = payload.get("is_table", False)
+                
+                if is_table or chunk_type == "table":
+                    table_chunks += 1
+                elif is_toc or chunk_type == "toc":
+                    toc_chunks += 1
+                else:
+                    text_chunks += 1
+                
+                # Группируем по файлам
+                file_name = payload.get("file_name", "unknown")
+                irvf_id = payload.get("irvf_id", "")
+                file_key = f"{file_name}_{irvf_id}"
+                
+                if file_key not in files_dict:
+                    files_dict[file_key] = {
+                        "file_name": file_name,
+                        "irvf_id": irvf_id,
+                        "text_chunks": 0,
+                        "toc_chunks": 0,
+                        "table_chunks": 0,
+                        "total_chunks": 0
+                    }
+                
+                files_dict[file_key]["total_chunks"] += 1
+                if is_table or chunk_type == "table":
+                    files_dict[file_key]["table_chunks"] += 1
+                elif is_toc or chunk_type == "toc":
+                    files_dict[file_key]["toc_chunks"] += 1
+                else:
+                    files_dict[file_key]["text_chunks"] += 1
+            
+            # Преобразуем словарь в список
+            files_info = list(files_dict.values())
+            
+            return RAGInfoResponse(
+                success=True,
+                irv_id=request.irv_id,
+                total_chunks=len(points),
+                text_chunks=text_chunks,
+                toc_chunks=toc_chunks,
+                table_chunks=table_chunks,
+                files_info=files_info
             ).model_dump()
             
         except ServiceError:
@@ -537,7 +678,7 @@ class RAGService:
             RAGService._config_cache = get_config()
         return RAGService._config_cache
     
-    def _get_cached_embedding(self, embed_api_key: Optional[str] = None, embed_url: Optional[str] = None, embed_model_name: Optional[str] = None):
+    def _get_cached_embedding(self, embed_api_key: Optional[str] = None, embed_url: Optional[str] = None, embed_model_name: Optional[str] = None, embed_batch_size: Optional[int] = None):
         """
         Получение объекта эмбеддингов с кэшированием.
         
@@ -545,6 +686,7 @@ class RAGService:
             embed_api_key: API ключ для эмбеддингов (если None, берется из переменной окружения)
             embed_url: URL API эмбеддингов (если None, берется из конфигурации)
             embed_model_name: Модель эмбеддингов (если None, берется из конфигурации)
+            embed_batch_size: Размер батча для эмбеддингов (если None, берется из конфигурации)
         """
         from rag.giga_embeddings import GigaEmbedding
         
@@ -580,9 +722,13 @@ class RAGService:
         final_api_url = embed_url or embeddings_config.get("api_url", "https://gigachat.devices.sberbank.ru/api/v1")
         final_model = embed_model_name or embeddings_config.get("model", "Embeddings")
         final_scope = embeddings_config.get("scope", "GIGACHAT_API_PERS")
-        batch_size = embeddings_config.get("batch_size", 10)
+        batch_size = embed_batch_size if embed_batch_size is not None else embeddings_config.get("batch_size", 10)
         max_retries = embeddings_config.get("max_retries", 3)
         timeout = embeddings_config.get("timeout", 60)
+        
+        # Логируем использование batch_size из запроса
+        if embed_batch_size is not None:
+            logger.debug(f"Используется batch_size из запроса: {embed_batch_size}")
         
         # Создаем ключ кэша на основе параметров
         cache_key = f"{final_api_url}:{final_model}:{final_scope}:{batch_size}:{max_retries}:{timeout}"
@@ -649,7 +795,8 @@ class RAGService:
         embedding = self._get_cached_embedding(
             embed_api_key=getattr(request, 'embed_api_key', None),
             embed_url=getattr(request, 'embed_url', None),
-            embed_model_name=getattr(request, 'embed_model_name', None)
+            embed_model_name=getattr(request, 'embed_model_name', None),
+            embed_batch_size=getattr(request, 'embed_batch_size', None)
         )
         
         # Инициализация векторного хранилища (кэшируется по vdb_url)
@@ -677,9 +824,14 @@ class RAGService:
         chunker,
         embedding,
         vector_store_manager,
-        temp_path: Path
+        temp_path: Path,
+        max_chunk_size: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Обработка одного файла."""
+        """Обработка одного файла.
+        
+        Args:
+            max_chunk_size: Максимальный размер чанка в символах (если указан, переопределяет значение из конфига)
+        """
         file_name = file_data.get("name", "unknown")
         irvf_id = file_data.get("irvfId")
         
@@ -712,7 +864,8 @@ class RAGService:
             # Обработка документа через chunker
             chunker_result = chunker.process_document(
                 str(temp_file_path),
-                document_id=f"{irv_id}_{irvf_id}"
+                document_id=f"{irv_id}_{irvf_id}",
+                max_chunk_size=max_chunk_size
             )
             
             # Подготовка метаданных для сохранения
@@ -733,24 +886,44 @@ class RAGService:
             
             # Индексация узлов
             if nodes or toc_nodes or table_nodes:
-                all_nodes = nodes + toc_nodes + table_nodes
-                texts = [node.text for node in all_nodes]
-                try:
-                    embeddings_list = embedding._get_text_embeddings(texts)
-                except (RuntimeError, ValueError) as e:
-                    # Ошибка получения токена доступа или неверный формат ответа GigaChat
-                    error_msg = str(e)
-                    logger.error(f"Ошибка при получении эмбеддингов для файла {file_name}: {error_msg}")
-                    raise ServiceError(
-                        error="Ошибка получения эмбеддингов",
-                        detail=f"Не удалось получить эмбеддинги для файла {file_name}: {error_msg}",
-                        code="embedding_error"
-                    )
+#                all_nodes = nodes + toc_nodes + table_nodes
+                all_nodes = nodes
                 
-                if len(embeddings_list) == len(all_nodes):
-                    # Сохранение в Qdrant
-                    points = []
-                    for node, emb in zip(all_nodes, embeddings_list):
+                # Обрабатываем чанки порциями, чтобы не перегружать API
+                # Размер порции равен batch_size эмбеддера (по умолчанию 10)
+                # Это позволяет избежать проблем с ограничениями API и улучшает производительность
+                batch_size = getattr(embedding, 'batch_size', 10)
+                all_embeddings = []
+                all_points = []
+                
+                # Обрабатываем узлы порциями
+                for i in range(0, len(all_nodes), batch_size):
+                    batch_nodes = all_nodes[i:i + batch_size]
+                    batch_texts = [node.text for node in batch_nodes]
+                    
+                    try:
+                        batch_embeddings = embedding._get_text_embeddings(batch_texts)
+                    except (RuntimeError, ValueError) as e:
+                        # Ошибка получения токена доступа или неверный формат ответа GigaChat
+                        error_msg = str(e)
+                        logger.error(f"Ошибка при получении эмбеддингов для файла {file_name} (порция {i//batch_size + 1}): {error_msg}")
+                        raise ServiceError(
+                            error="Ошибка получения эмбеддингов",
+                            detail=f"Не удалось получить эмбеддинги для файла {file_name}: {error_msg}",
+                            code="embedding_error"
+                        )
+                    
+                    if len(batch_embeddings) != len(batch_nodes):
+                        error_msg = f"Несоответствие количества эмбеддингов для порции {i//batch_size + 1} файла {file_name}: получено {len(batch_embeddings)}, ожидалось {len(batch_nodes)}"
+                        logger.error(error_msg)
+                        raise ServiceError(
+                            error="Ошибка получения эмбеддингов",
+                            detail=error_msg,
+                            code="embedding_error"
+                        )
+                    
+                    # Формируем точки для текущей порции
+                    for node, emb in zip(batch_nodes, batch_embeddings):
                         point = PointStruct(
                             id=str(uuid.uuid4()),
                             vector=emb,
@@ -759,11 +932,15 @@ class RAGService:
                                 **node.metadata
                             }
                         )
-                        points.append(point)
+                        all_points.append(point)
                     
+                    all_embeddings.extend(batch_embeddings)
+                
+                # Сохранение всех точек в Qdrant одной операцией
+                if all_points:
                     vector_store_manager.client.upsert(
                         collection_name=vector_store_manager.collection_name,
-                        points=points
+                        points=all_points
                     )
                     
                     return {

@@ -51,7 +51,8 @@ class ChunkerIntegration:
     def process_document(
         self, 
         document_path: str, 
-        document_id: Optional[str] = None
+        document_id: Optional[str] = None,
+        max_chunk_size: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Обработка документа через SmartChanker.
@@ -59,6 +60,7 @@ class ChunkerIntegration:
         Args:
             document_path: Путь к документу для обработки
             document_id: Уникальный идентификатор документа (если None, генерируется из имени файла)
+            max_chunk_size: Максимальный размер чанка в символах (если указан, переопределяет значение из конфига)
         
         Returns:
             Словарь с результатами обработки:
@@ -76,6 +78,21 @@ class ChunkerIntegration:
         
         logger.info(f"Обработка документа: {document_path} (ID: {document_id})")
         
+        # Применяем max_chunk_size, если он передан
+        original_max_chunk_size = None
+        if max_chunk_size is not None:
+            # Сохраняем оригинальное значение для восстановления
+            if hasattr(self.chunker, 'config') and isinstance(self.chunker.config, dict):
+                hierarchical_chunking = self.chunker.config.get("hierarchical_chunking", {})
+                if isinstance(hierarchical_chunking, dict):
+                    original_max_chunk_size = hierarchical_chunking.get("max_chunk_size")
+                    hierarchical_chunking["max_chunk_size"] = max_chunk_size
+                    logger.info(f"Используется max_chunk_size из запроса: {max_chunk_size} символов")
+                # Также обновляем для table_processing
+                table_processing = self.chunker.config.get("table_processing", {})
+                if isinstance(table_processing, dict):
+                    table_processing["max_chunk_size"] = max_chunk_size
+        
         # Создание выходной директории для этого документа
         doc_output_dir = self.output_dir / document_id
         doc_output_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +103,16 @@ class ChunkerIntegration:
                 str(doc_path),
                 str(doc_output_dir)
             )
+            
+            # Восстанавливаем оригинальное значение max_chunk_size
+            if max_chunk_size is not None and original_max_chunk_size is not None:
+                if hasattr(self.chunker, 'config') and isinstance(self.chunker.config, dict):
+                    hierarchical_chunking = self.chunker.config.get("hierarchical_chunking", {})
+                    if isinstance(hierarchical_chunking, dict):
+                        hierarchical_chunking["max_chunk_size"] = original_max_chunk_size
+                    table_processing = self.chunker.config.get("table_processing", {})
+                    if isinstance(table_processing, dict):
+                        table_processing["max_chunk_size"] = original_max_chunk_size
             
             logger.info(f"Документ обработан успешно. Результаты сохранены в: {doc_output_dir}")
             

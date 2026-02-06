@@ -404,3 +404,121 @@ def _save_chat_history_update(
     except Exception as e:
         logger.exception("Ошибка сохранения истории чата (обновление): {}", e)
         raise
+
+
+def save_result_file(
+    siu_client: Any,
+    result_irv_id: str,
+    content: str,
+    file_name: str,
+) -> Optional[dict]:
+    """
+    Сохранение файла с текстом ответа в указанный ИО.
+    
+    Args:
+        siu_client: Клиент для работы с СИУ
+        result_irv_id: Идентификатор версии информационного объекта для сохранения файла ответа
+        content: Текст ответа для сохранения
+        file_name: Имя файла (с расширением .txt)
+    
+    Returns:
+        Результат создания новой версии ИО или None при ошибке
+    """
+    if not result_irv_id or not str(result_irv_id).strip():
+        logger.warning("save_result_file: result_irv_id не задан")
+        return None
+    
+    if not content or not str(content).strip():
+        logger.warning("save_result_file: содержимое файла пусто")
+        return None
+    
+    if not file_name or not str(file_name).strip():
+        logger.warning("save_result_file: имя файла не задано")
+        return None
+    
+    # Убеждаемся, что имя файла имеет расширение .txt
+    file_name = str(file_name).strip()
+    if not file_name.endswith('.txt'):
+        file_name = f"{file_name}.txt"
+    
+    try:
+        # Получаем информацию об ИО
+        irv_info = siu_client.get_irv(result_irv_id, with_files=True)
+        if not isinstance(irv_info, dict):
+            logger.warning("save_result_file: не удалось получить информацию об ИО {}", result_irv_id)
+            return None
+        
+        # Извлекаем io_id и другие необходимые данные
+        io_id = _extract_io_id(irv_info)
+        if not io_id:
+            logger.warning("save_result_file: не удалось извлечь io_id из ИО {}", result_irv_id)
+            return None
+        
+        # Извлекаем parent_id и nau_id для создания новой версии
+        parent_id = _extract_parent_id(irv_info)
+        nau_id = _extract_nau_id(irv_info)
+        
+        if not parent_id:
+            logger.warning("save_result_file: не удалось извлечь parent_id из ИО {}", result_irv_id)
+            return None
+        
+        if not nau_id:
+            logger.warning("save_result_file: не удалось извлечь nau_id из ИО {}", result_irv_id)
+            return None
+        
+        # Создаем новую версию ИО с файлом
+        # Используем имя файла без расширения как название версии
+        version_name = file_name.replace('.txt', '')
+        create_result = siu_client.create_ir(
+            irv_name=version_name,
+            parent_folder_id=parent_id,
+            nau_id=nau_id,
+            description=f"Ответ сохранен в файле {file_name}",
+            file_name=file_name,
+            io_id=io_id,  # Создаем новую версию существующего ИО
+        )
+        
+        new_irv_id = _extract_irv_id_from_response(create_result)
+        if not new_irv_id:
+            logger.warning("save_result_file: не удалось извлечь id созданной версии ИО")
+            return None
+        
+        # Получаем информацию о файле из новой версии
+        new_irv = siu_client.get_irv(new_irv_id, with_files=True)
+        if not isinstance(new_irv, dict):
+            logger.warning("save_result_file: get_irv вернул не dict для новой версии ИО {}", new_irv_id)
+            return None
+        
+        # Извлекаем файлы из ответа get_irv
+        files_attr = new_irv.get("attrMap", {})
+        if not isinstance(files_attr, dict):
+            logger.warning("save_result_file: attrMap не найден или не является dict")
+            return None
+        
+        files_value = files_attr.get("Файлы", {})
+        if not isinstance(files_value, dict):
+            logger.warning("save_result_file: поле 'Файлы' не найдено или не является dict")
+            return None
+        
+        files_data = files_value.get("value", [])
+        if not isinstance(files_data, list):
+            logger.warning("save_result_file: value поля 'Файлы' не является list")
+            return None
+        
+        files_list = _files_list(files_data)
+        file_obj = _find_file_by_name(files_list, file_name)
+        if not file_obj:
+            logger.warning("save_result_file: файл {} не найден у новой версии ИО {}", file_name, new_irv_id)
+            return None
+        
+        # Сохраняем содержимое файла
+        siu_client.post_irv_file_content(file_obj, content)
+        logger.info("Файл ответа {} успешно сохранен в ИО {}", file_name, new_irv_id)
+        
+        return create_result if isinstance(create_result, dict) else None
+        
+    except ServiceError:
+        raise
+    except Exception as e:
+        logger.exception("Ошибка сохранения файла ответа: {}", e)
+        raise

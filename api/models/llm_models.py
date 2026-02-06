@@ -47,6 +47,10 @@ class AssistantRequest(BaseModel):
          Если не пусто — используется заданная история чата, system_prompt игнорируется;
          иначе используется system_prompt"""
     )
+    result_irv_id: Optional[str] = Field(
+        default=None,
+        description="Идентификатор версии информационного объекта с файлом ответа. Если задан, к этому ИО будет приложен файл с текстом ответа (расширение .txt, имя из title ответа)"
+    )
     system_prompt: Optional[str] = Field(None, description="Системный промпт (используется только при пустой истории чата)")
     temperature: float = Field(0.2, description="Температура генерации")
     max_tokens: int = Field(8000, description="Максимальное количество токенов")
@@ -63,6 +67,7 @@ class AssistantRequest(BaseModel):
     embed_auth_type: Optional[str] = Field(None, description="Тип авторизации эмбеддингов")
     embed_model_name: Optional[str] = Field(None, description="Модель эмбеддингов")
     embed_url: Optional[str] = Field(None, description="URL API эмбеддингов")
+    embed_batch_size: Optional[int] = Field(None, description="Размер батча для эмбеддингов", gt=0)
     
     # Поиск и БД
     search_api_key: Optional[str] = Field(None, description="API ключ поиска")
@@ -72,6 +77,9 @@ class AssistantRequest(BaseModel):
     # Режимы
     file_irv_ids: Optional[List[str]] = Field(None, description="Идентификаторы версий информационных объектов со входными файлами")
     internet: bool = Field(False, description="Использовать интернет")
+    
+    # Параметры чанкера (для RAG)
+    max_chunk_size: Optional[int] = Field(None, description="Максимальный размер чанка в символах", gt=0)
     knowledge_base: bool = Field(False, description="Использовать базу знаний")
 
     # Контекст
@@ -108,6 +116,10 @@ class RAGRequest(BaseModel):
     embed_api_key: Optional[str] = Field(None, description="API ключ для эмбеддингов")
     embed_url: Optional[str] = Field(None, description="URL API эмбеддингов")
     embed_model_name: Optional[str] = Field(None, description="Модель эмбеддингов")
+    embed_batch_size: Optional[int] = Field(None, description="Размер батча для эмбеддингов", gt=0)
+    
+    # Параметры чанкера (опционально, если не указаны - используются из конфигурации)
+    max_chunk_size: Optional[int] = Field(None, description="Максимальный размер чанка в символах", gt=0)
 
 
 class RAGAddResponse(BaseModel):
@@ -128,6 +140,18 @@ class RAGRemoveResponse(BaseModel):
     success: bool = Field(..., description="Успешность операции")
     irv_id: str = Field(..., description="Идентификатор версии ИО")
     chunks_deleted: int = Field(..., description="Количество удаленных чанков")
+
+
+class RAGInfoResponse(BaseModel):
+    """Ответ при получении информации о файле в RAG."""
+    
+    success: bool = Field(..., description="Успешность операции")
+    irv_id: str = Field(..., description="Идентификатор версии ИО")
+    total_chunks: int = Field(..., description="Общее количество чанков")
+    text_chunks: int = Field(0, description="Количество обычных текстовых чанков")
+    toc_chunks: int = Field(0, description="Количество чанков оглавления")
+    table_chunks: int = Field(0, description="Количество чанков таблиц")
+    files_info: List[Dict[str, Any]] = Field(default_factory=list, description="Информация о каждом файле")
 
 
 class CollectionListRequest(BaseModel):

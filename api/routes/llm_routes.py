@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from api.chat_history import load_chat_history, save_chat_history
+from api.chat_history import load_chat_history, save_chat_history, save_result_file
 from api.models.llm_models import (
     AssistantRequest, 
     error_response_body, 
@@ -159,6 +159,35 @@ async def generate_response(
         except Exception as e:
             logger.exception("Ошибка при сохранении истории чата: {}", e)
 
+        # Если задан result_irv_id, сохраняем файл с текстом ответа
+        if request.result_irv_id:
+            try:
+                # Определяем имя файла из chat_title или title ответа
+                file_name = response.get("chat_title") or response.get("title") or "Ответ"
+                # Убираем недопустимые символы из имени файла
+                file_name = re.sub(r'[<>:"/\\|?*]', '_', file_name)
+                file_name = file_name.strip()[:200]  # Ограничиваем длину имени файла
+                if not file_name:
+                    file_name = "Ответ"
+                
+                # Получаем текст ответа
+                answer_content = response.get("content", "") or ""
+                
+                if answer_content:
+                    save_result_file(
+                        siu_client,
+                        result_irv_id=request.result_irv_id,
+                        content=answer_content,
+                        file_name=file_name,
+                    )
+                    logger.info("Файл ответа успешно сохранен в ИО {}", request.result_irv_id)
+                else:
+                    logger.warning("Текст ответа пуст, файл не сохранен")
+            except ServiceError as e:
+                logger.warning("Сохранение файла ответа не выполнено: {} {}", e.error, e.detail)
+            except Exception as e:
+                logger.exception("Ошибка при сохранении файла ответа: {}", e)
+
         logger.info("Ответ успешно сгенерирован")
         # Формируем ответ с content и опционально chat_history
         body = _normalize_content_to_response(response.get("content", ""))
@@ -247,9 +276,10 @@ async def clear_cache(
     "/rag/manage",
     summary="Управление файлами в RAG",
     description=(
-        "Добавление или удаление файлов информационного объекта в векторную базу данных. "
+        "Управление файлами информационного объекта в векторной базе данных. "
         "В режиме 'add' файлы docx и txt обрабатываются через SmartChanker и сохраняются в БД. "
-        "В режиме 'remove' удаляются все чанки, связанные с указанным irv_id."
+        "В режиме 'remove' удаляются все чанки, связанные с указанным irv_id. "
+        "В режиме 'info' получается информация о файле в векторной БД (количество чанков, типы и т.д.)."
     ),
 )
 async def manage_rag_files(
@@ -270,12 +300,12 @@ async def manage_rag_files(
         logger.info(f"Получен запрос на управление RAG файлами: action={request.action}, irv_id={request.irv_id}")
         
         # Валидация action
-        if request.action not in ["add", "remove"]:
+        if request.action not in ["add", "remove", "info"]:
             return JSONResponse(
                 status_code=200,
                 content=error_response_body(
                     error="Ошибка валидации запроса",
-                    detail=f"Недопустимое значение action: '{request.action}'. Допустимые значения: 'add', 'remove'.",
+                    detail=f"Недопустимое значение action: '{request.action}'. Допустимые значения: 'add', 'remove', 'info'.",
                     code="invalid_action",
                 ),
             )
@@ -293,8 +323,14 @@ async def manage_rag_files(
             if isinstance(result, dict) and "success" in result:
                 result = {k: v for k, v in result.items() if k != "success"}
             return JSONResponse(status_code=200, content={"content": result})
-        else:  # remove
+        elif request.action == "remove":
             result = rag_service.remove_files_from_rag(request)
+            # Убираем поле success, если оно есть
+            if isinstance(result, dict) and "success" in result:
+                result = {k: v for k, v in result.items() if k != "success"}
+            return JSONResponse(status_code=200, content={"content": result})
+        else:  # info
+            result = rag_service.get_file_info(request)
             # Убираем поле success, если оно есть
             if isinstance(result, dict) and "success" in result:
                 result = {k: v for k, v in result.items() if k != "success"}

@@ -54,7 +54,7 @@ api:
   version: "0.1.0"
 
 logging:
-  level: "DEBUG"
+  level: "INFO"
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}"
   clear_log_on_start: true  # Очищать лог-файл при старте приложения
 

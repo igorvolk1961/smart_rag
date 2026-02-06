@@ -9,7 +9,7 @@
   "hierarchical_chunking": {
     "enabled": true,
     "target_level": 3,
-    "max_chunk_size": 2000
+    "max_chunk_size": 4096
   }
 }
 

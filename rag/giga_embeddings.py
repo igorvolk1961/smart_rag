@@ -2,6 +2,7 @@
 Кастомный эмбеддинг-класс для GigaChat API (GigaEmbeddings).
 """
 
+import json
 import logging
 import time
 import asyncio
@@ -63,6 +64,8 @@ class GigaEmbedding(BaseEmbedding):
         object.__setattr__(self, 'embedding_dim', embedding_dim)
         object.__setattr__(self, 'access_token', None)
         object.__setattr__(self, 'token_obtained_at', None)  # Время получения токена
+        object.__setattr__(self, 'max_json_payload_size', 0)  # Максимальный размер JSON payload, успешно обработанный
+        object.__setattr__(self, 'best_text_length', 0)  # Максимальная длина текста, успешно обработанная
         
         logger.info(
             f"GigaEmbedding инициализирован: model={model}, "
@@ -455,7 +458,7 @@ class GigaEmbedding(BaseEmbedding):
                             logger.error(error_msg)
                             raise RuntimeError(error_msg)
                     except (RuntimeError, ValueError) as e:
-                        # Ошибка получения токена доступа или неверный формат ответа - пробрасываем дальше
+                        # Все ошибки пробрасываем дальше - не скрываем их!
                         logger.error(f"Ошибка при получении эмбеддинга: {e}")
                         raise
                 
@@ -528,7 +531,12 @@ class GigaEmbedding(BaseEmbedding):
         
         Returns:
             Эмбеддинг или None при ошибке
+            
+        Raises:
+            RuntimeError: При ошибках получения токена или превышении размера запроса
+            ValueError: При неверном формате ответа API
         """
+        text_length = len(text)
         endpoint = f"{self.api_url}/embeddings"
         
         # Получаем токен доступа
@@ -543,6 +551,13 @@ class GigaEmbedding(BaseEmbedding):
             "input": text
         }
         
+        # Вычисляем размер payload для отслеживания максимального успешного размера
+        try:
+            json_payload_str = json.dumps(payload, ensure_ascii=False)
+            json_payload_size = len(json_payload_str.encode('utf-8'))
+        except Exception:
+            json_payload_size = 0
+        
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
@@ -552,6 +567,11 @@ class GigaEmbedding(BaseEmbedding):
             with httpx.Client(timeout=self.timeout, verify=False) as client:
                 response = client.post(endpoint, json=payload, headers=headers)
                 response.raise_for_status()
+                
+                # Обновляем максимальные успешные размеры
+                if json_payload_size > self.max_json_payload_size:
+                    object.__setattr__(self, 'max_json_payload_size', json_payload_size)
+                    object.__setattr__(self, 'best_text_length', text_length)
                 
                 data = response.json()
                 
@@ -598,6 +618,20 @@ class GigaEmbedding(BaseEmbedding):
                 if token and attempt < self.max_retries - 1:
                     # Повторяем запрос с новым токеном
                     return self._get_single_embedding(text, attempt + 1)
+            
+            # Обработка ошибки 413 - суммарный размер тела запроса слишком велик
+            if e.response.status_code == 413:
+                error_msg = (
+                    f"GigaChat API вернул ошибку 413 Request Entity Too Large. "
+                    f"Суммарный размер тела запроса к сервису эмбеддера слишком велик. "
+                    f"Максимальный успешно обработанный размер: JSON payload={self.max_json_payload_size} байт, "
+                    f"длина текста={self.best_text_length} символов. "
+                    f"Рекомендуется уменьшить параметр batch_size (текущее значение: {self.batch_size}) "
+                    f"или уменьшить max_chunk_size в настройках чанкера. "
+                    f"Попробуйте установить batch_size в значение меньше текущего, например: {max(1, self.batch_size // 2)}."
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
             
             logger.error(f"HTTP ошибка {e.response.status_code}: {e.response.text}")
             raise
